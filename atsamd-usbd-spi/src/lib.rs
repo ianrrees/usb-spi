@@ -26,20 +26,9 @@ use usb_device::{class_prelude::*, Result};
 /// This should be used as `device_class` when building the `UsbDevice`.
 pub const USB_CLASS_CDC: u8 = 0x02;
 
-const USB_CLASS_CDC_DATA: u8 = 0x0a;
-const CDC_SUBCLASS_ACM: u8 = 0x02; // PSTN Abstract Control Model
-const CDC_PROTOCOL_NONE: u8 = 0x00;
-
-const CS_INTERFACE: u8 = 0x24;
-const CDC_TYPE_HEADER: u8 = 0x00;
-const CDC_TYPE_CALL_MANAGEMENT: u8 = 0x01;
-const CDC_TYPE_ACM: u8 = 0x02;
-const CDC_TYPE_UNION: u8 = 0x06;
-
-const REQ_SEND_ENCAPSULATED_COMMAND: u8 = 0x00;
-const REQ_SET_LINE_CODING: u8 = 0x20;
-const REQ_GET_LINE_CODING: u8 = 0x21;
-const REQ_SET_CONTROL_LINE_STATE: u8 = 0x22;
+const USB_CLASS_VENDOR_SPECIFIC: u8 = 0xFF; // TODO push up to a protocol crate
+const USB_SUBCLASS_VENDOR_SPECIFIC_USB_SPI: u8 = 0x02; // TODO push up to a protocol crate
+const USB_SPI_PROTOCOL_0: u8 = 0x00; // TODO push up to a protocol crate
 
 /// TX and RX buffers used by the UsbSpi
 ///
@@ -69,11 +58,9 @@ pub struct UsbSpi<'a, B, const ENDPOINT_SIZE: usize>
 where
     B: UsbBus,
 {
-    comm_if: InterfaceNumber,
-    comm_ep: EndpointIn<'a, B>,
-    data_if: InterfaceNumber,
-    read_ep: EndpointOut<'a, B>,
-    write_ep: EndpointIn<'a, B>,
+    usb_interface: InterfaceNumber,
+    read_endpoint: EndpointOut<'a, B>,
+    write_endpoint: EndpointIn<'a, B>,
 
     /// UART end of the UART->USB buffer
     uart_to_usb_producer: Producer<'a, U256>,
@@ -88,10 +75,6 @@ where
     usb_to_uart_consumer: Consumer<'a, U256>,
 
     write_state: WriteState,
-
-    // TODO just for debugging the HAL USB stuff
-    read_count: usize,
-    skip_count: usize,
 }
 
 /// If this many full size packets have been sent in a row, a short packet will
@@ -123,11 +106,9 @@ where
         let (usb_to_uart_producer, usb_to_uart_consumer) = storage.tx_buffer.try_split().unwrap();
 
         Self {
-            comm_if: alloc.interface(),
-            comm_ep: alloc.interrupt(8, 255),
-            data_if: alloc.interface(),
-            read_ep: alloc.bulk(ENDPOINT_SIZE as u16),
-            write_ep: alloc.bulk(ENDPOINT_SIZE as u16),
+            usb_interface: alloc.interface(),
+            read_endpoint: alloc.bulk(ENDPOINT_SIZE as u16),
+            write_endpoint: alloc.bulk(ENDPOINT_SIZE as u16),
 
             uart_to_usb_producer,
             uart_to_usb_consumer,
@@ -135,8 +116,6 @@ where
             usb_to_uart_consumer,
 
             write_state: WriteState::NotFull,
-            read_count: 0,
-            skip_count: 0,
         }
     }
 
@@ -164,7 +143,7 @@ where
                     grant.buf()
                 };
 
-                match self.write_ep.write(write_slice) {
+                match self.write_endpoint.write(write_slice) {
                     Ok(count) => {
                         // TODO it would be nice to release only after we get
                         // the endpoint_in_complete() callback, so we're sure
@@ -193,7 +172,7 @@ where
                 if let WriteState::Full(_) = self.write_state {
                     // Need to send a Zero Length Packet to
                     // signal the end of a transaction
-                    match self.write_ep.write(&[]) {
+                    match self.write_endpoint.write(&[]) {
                         Ok(_) => {
                             self.write_state = WriteState::NotFull;
                         }
@@ -308,62 +287,15 @@ where
     B: UsbBus,
 {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> Result<()> {
-        writer.iad(
-            self.comm_if,
-            2,
-            USB_CLASS_CDC,
-            CDC_SUBCLASS_ACM,
-            CDC_PROTOCOL_NONE,
-        )?;
-
         writer.interface(
-            self.comm_if,
-            USB_CLASS_CDC,
-            CDC_SUBCLASS_ACM,
-            CDC_PROTOCOL_NONE,
+            self.usb_interface,
+            USB_CLASS_VENDOR_SPECIFIC,
+            USB_SUBCLASS_VENDOR_SPECIFIC_USB_SPI,
+            USB_SPI_PROTOCOL_0,
         )?;
 
-        writer.write(
-            CS_INTERFACE,
-            &[
-                CDC_TYPE_HEADER, // bDescriptorSubtype
-                0x10,
-                0x01, // bcdCDC (1.10)
-            ],
-        )?;
-
-        writer.write(
-            CS_INTERFACE,
-            &[
-                CDC_TYPE_ACM, // bDescriptorSubtype
-                0x00,         // bmCapabilities
-            ],
-        )?;
-
-        writer.write(
-            CS_INTERFACE,
-            &[
-                CDC_TYPE_UNION,      // bDescriptorSubtype
-                self.comm_if.into(), // bControlInterface
-                self.data_if.into(), // bSubordinateInterface
-            ],
-        )?;
-
-        writer.write(
-            CS_INTERFACE,
-            &[
-                CDC_TYPE_CALL_MANAGEMENT, // bDescriptorSubtype
-                0x00,                     // bmCapabilities
-                self.data_if.into(),      // bDataInterface
-            ],
-        )?;
-
-        writer.endpoint(&self.comm_ep)?;
-
-        writer.interface(self.data_if, USB_CLASS_CDC_DATA, 0x00, 0x00)?;
-
-        writer.endpoint(&self.write_ep)?;
-        writer.endpoint(&self.read_ep)?;
+        writer.endpoint(&self.write_endpoint)?;
+        writer.endpoint(&self.read_endpoint)?;
 
         Ok(())
     }
@@ -377,53 +309,35 @@ where
 
     fn poll(&mut self) {
         // See if the host has more data to send over the UART
-        if self.read_count % 10 == 0 {
-            if self.skip_count == 0 {
-                defmt::info!("Skipping! {:?}", self.read_count);
+        match self.usb_to_uart_producer.grant_exact(ENDPOINT_SIZE) {
+            Ok(mut grant) => {
+                match self.read_endpoint.read(grant.buf()) {
+                    Ok(count) => {
+                        grant.commit(count);
+                        // TODO note this is only reliable if the UART ISR is higher prio than USB; may be better to put that flag back...
+                        self.flush_spi(); // NOP if the UART is already busy
+                    }
+                    Err(UsbError::WouldBlock) => {
+                        // No data to read, just drop the grant
+                    }
+                    Err(_) => {
+                        // TODO handle this better
+                        defmt::error!("Error reading TX data");
+                    }
+                };
             }
-            if self.skip_count < 10 {
-                self.skip_count += 1;
-            } else {
-                self.skip_count = 0;
-                self.read_count += 1;
-            }
-        } else {
-            match self.usb_to_uart_producer.grant_exact(ENDPOINT_SIZE) {
-                Ok(mut grant) => {
-                    self.read_count += 1;
-                    match self.read_ep.read(grant.buf()) {
-                        Ok(count) => {
-                            grant.commit(count);
-                            // TODO note this is only reliable if the UART ISR is higher prio than USB; may be better to put that flag back...
-                            self.flush_spi(); // NOP if the UART is already busy
-                        }
-                        Err(UsbError::WouldBlock) => {
-                            // No data to read, just drop the grant
-                        }
-                        Err(_) => {
-                            // TODO handle this better
-                            defmt::error!("Error reading TX data");
-                        }
-                    };
-                }
-                Err(_) => {
-                    // Since we don't have anywhere to put more data, we can't read
-                    // data out of the USB endpoint.  The USB hardware will NAK
-                    // transfers, and the host will decide whether to retry, until
-                    // we eventually read.  In the meantime, clear interrupt flags
-                    // in the USB endpoint hardware with an empty read:
-                    let _ = self.read_ep.read(&mut []);
-                    self.read_count += 1;
+            Err(_) => {
+                // Since we don't have anywhere to put more data, we can't read
+                // data out of the USB endpoint.
 
-                    self.flush_spi(); // Ensure we continue draining the buffer
-                }
+                self.flush_spi(); // Ensure we continue draining the buffer
             }
         }
         self.flush_usb();
     }
 
     fn endpoint_in_complete(&mut self, addr: EndpointAddress) {
-        if addr == self.write_ep.address() {
+        if addr == self.write_endpoint.address() {
             // We've written a bulk transfer out; flush in case there's more buffered data
             self.flush_usb();
         }
@@ -434,35 +348,21 @@ where
 
         if !(req.request_type == control::RequestType::Class
             && req.recipient == control::Recipient::Interface
-            && req.index == u8::from(self.comm_if) as u16)
+            && req.index == u8::from(self.usb_interface) as u16)
         {
             return;
         }
 
-        // match req.request {
-        //     REQ_GET_LINE_CODING if req.length == 7 => {
-        //         xfer.accept(|data| {
-        //             data[0..4].copy_from_slice(&self.line_coding.baud.to_le_bytes());
-        //             data[4] = self.line_coding.stop_bits as u8;
-        //             data[5] = match self.line_coding.parity {
-        //                 None => 0,
-        //                 Some(Parity::Even) => 2,
-        //                 Some(Parity::Odd) => 1,
-        //             };
-        //             data[6] = 8;
+        defmt::info!("USB-SPI got a Control IN request! {:?}", req.request);
 
-        //             Ok(7)
-        //         })
-        //         .unwrap_or_else(|_| defmt::error!("USB-UART Failed to accept REQ_GET_LINE_CODING"));
-        //     }
-
-        //     _ => {
-        //         defmt::info!("USB-UART rejecting control_in request");
-        //         xfer.reject().unwrap_or_else(|_| {
-        //             defmt::error!("USB-UART Failed to reject control IN request")
-        //         });
-        //     }
-        // }
+        match req.request {
+            _ => {
+                defmt::info!("USB-SPI rejecting control_in request");
+                xfer.reject().unwrap_or_else(|_| {
+                    defmt::error!("USB-SPI Failed to reject control IN request")
+                });
+            }
+        }
     }
 
     fn control_out(&mut self, xfer: ControlOut<B>) {
@@ -470,95 +370,18 @@ where
 
         if !(req.request_type == control::RequestType::Class
             && req.recipient == control::Recipient::Interface
-            && req.index == u8::from(self.comm_if) as u16)
+            && req.index == u8::from(self.usb_interface) as u16)
         {
             return;
         }
 
+        defmt::info!("USB-SPI got a Control OUT request! {:?}", req.request);
+
         match req.request {
-            REQ_SEND_ENCAPSULATED_COMMAND => {
-                // We don't actually support encapsulated commands but pretend
-                // we do for standards compatibility.
-                xfer.accept().unwrap_or_else(|_| {
-                    defmt::error!("USB-UART Failed to accept REQ_SEND_ENCAPSULATED_COMMAND")
-                });
-            }
-
-            REQ_SET_LINE_CODING if xfer.data().len() >= 7 => {
-                // let new_baud = u32::from_le_bytes(xfer.data()[0..4].try_into().unwrap());
-                // let new_stop_bits = match xfer.data()[4] {
-                //     0 => Some(StopBits::OneBit),
-                //     // 1 means 1.5 stop bits, unsupported by hardware
-                //     2 => Some(StopBits::TwoBits),
-                //     _ => None,
-                // };
-                // let new_parity_type = match xfer.data()[5] {
-                //     0 => Some(None),
-                //     1 => Some(Some(Parity::Odd)),
-                //     2 => Some(Some(Parity::Even)),
-                //     // 3 means Mark, unsupported by hardware
-                //     // 4 means Space, unsupported by hardware
-                //     _ => None,
-                // };
-                // let new_data_bits = xfer.data()[6];
-
-                // // TODO ensure the baud is within limits
-                // if if new_stop_bits.is_none() {
-                //     defmt::warn!(
-                //         "Rejecting unsupported stop bit request code {:?}",
-                //         xfer.data()[4]
-                //     );
-                //     false
-                // } else if new_parity_type.is_none() {
-                //     defmt::warn!(
-                //         "Rejecting unsupported parity request code {:?}",
-                //         xfer.data()[5]
-                //     );
-                //     false
-                // } else if new_data_bits != 8 {
-                //     defmt::warn!(
-                //         "Rejecting unsupported {:?}b line coding request",
-                //         new_data_bits
-                //     );
-                //     false
-                // } else {
-                //     // New config is valid, so apply it
-                //     // TODO split this out in to a separate method, and use that when we're reset
-                //     self.uart.reconfigure(|c| {
-                //         c.baud(Hertz(new_baud), BAUDMODE)
-                //             .stop_bit(new_stop_bits.unwrap())
-                //             .parity(new_parity_type.unwrap())
-                //     });
-
-                //     self.line_coding.baud = new_baud;
-                //     self.line_coding.stop_bits = new_stop_bits.unwrap();
-                //     self.line_coding.parity = new_parity_type.unwrap();
-                //     true
-                // } {
-                    xfer.accept().unwrap_or_else(|_| {
-                        defmt::error!("USB-UART Failed to accept REQ_SET_LINE_CODING")
-                    });
-                // } else {
-                //     xfer.reject().unwrap_or_else(|_| {
-                //         defmt::error!("USB-UART Failed to reject REQ_SET_LINE_CODING")
-                //     });
-                // }
-            }
-
-            REQ_SET_CONTROL_LINE_STATE => {
-                // defmt::info!("REQ_SET_CONTROL_LINE_STATE"); // TODO
-                // self.dtr = (req.value & 0x0001) != 0;
-                // self.rts = (req.value & 0x0002) != 0;
-
-                xfer.accept().unwrap_or_else(|_| {
-                    defmt::error!("USB-UART Failed to accept REQ_SET_CONTROL_LINE_STATE")
-                });
-            }
-
             _ => {
-                defmt::info!("USB-UART rejecting control_out request");
+                defmt::info!("USB-SPI rejecting control_out request");
                 xfer.reject().unwrap_or_else(|_| {
-                    defmt::error!("USB-UART Failed to reject control OUT request")
+                    defmt::error!("USB-SPI Failed to reject control OUT request")
                 });
             }
         };
