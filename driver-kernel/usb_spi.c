@@ -8,7 +8,7 @@
 #include <linux/usb.h>
 
 struct usb_spi {
-
+	struct usb_device *usb_dev;
 };
 
 static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_id *id)
@@ -30,7 +30,7 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		return -ENOMEM;
 	}
 
-    usb_set_intfdata(probing_interface, usb_spi);
+	usb_spi->usb_dev = usb_dev;
 
 	usb_set_intfdata(usb_if, usb_spi);
 	return 0;
@@ -40,9 +40,10 @@ static void usb_spi_disconnect(struct usb_interface *interface)
 {
 	struct usb_spi *usb_spi = usb_get_intfdata(interface);
 
-    printk(KERN_INFO "USB-SPI removed\n");
-    
-    kfree(usb_spi);
+	dev_info(&usb_spi->usb_dev->dev, "USB-SPI disconnected");
+
+	usb_put_dev(usb_spi->usb_dev);
+	kfree(usb_spi);
 }
 
 static struct usb_device_id usb_spi_id[] =
