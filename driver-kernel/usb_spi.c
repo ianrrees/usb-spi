@@ -8,9 +8,26 @@
 #include <linux/usb.h>
 #include <linux/spi/spi.h>
 
+// Generated from a Rust package
+#include "../protocol/usb-spi-protocol.h"
+
+#define USB_TIMEOUT_MS 1000
+
+struct usb_spi_connected_peripheral {
+	// May not be necessary to store this?
+	char modalias[SPI_NAME_SIZE];
+	// during probe, bool whether the hardware provides an IRQ. Then the IRQ
+	int irq;
+	// TODO platform data
+};
+
 struct usb_spi_device {
 	struct usb_device *usb_dev;
 	struct spi_master *spi_master;
+	struct usb_spi_connected_peripheral *connected;
+	u16 usb_interface_index;
+	u16 connected_peripheral_count;
+	u8 *usb_buffer;
 };
 
 static int usb_spi_setup(struct spi_device *spi)
@@ -32,6 +49,88 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 	return 0;
 }
 
+// TODO this is bound to exist somewhere else...
+// Error list is from https://www.kernel.org/doc/html/latest/driver-api/usb/error-codes.html
+static const char * error_to_string(int err)
+{
+	if (err >= 0) {
+		return "None";
+	}
+
+	switch (err) {
+		case -ENOMEM:       return "ENOMEM";
+		case -EBUSY:        return "EBUSY";
+		case -ENODEV:       return "ENODEV";
+		case -ENOENT:       return "ENOENT";
+		case -ENXIO:        return "ENXIO";
+		case -EINVAL:       return "EINVAL";
+		case -EXDEV:        return "EXDEV";
+		case -EFBIG:        return "EFBIG";
+		case -EPIPE:        return "EPIPE"; //usb_control_msg returns this when the firmware rejects
+		case -EMSGSIZE:     return "EMSGSIZE";
+		case -EBADR:        return "EBADR";
+		case -ENOSPC:       return "ENOSPC";
+		case -ESHUTDOWN:    return "ESHUTDOWN";
+		case -EPERM:        return "EPERM";
+		case -EHOSTUNREACH: return "EHOSTUNREACH";
+		case -ENOEXEC:      return "ENOEXEC";
+		case -ETIMEDOUT:    return "ETIMEDOUT";
+		default:            return "???";
+	}
+}
+
+/// Returns number of bytes transferred, or negative error code
+static int usb_spi_control_in(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
+{
+	return usb_control_msg(
+		usb_spi->usb_dev,
+		usb_sndctrlpipe(usb_spi->usb_dev, 0),
+		request,
+		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_IN,
+		value,
+		usb_spi->usb_interface_index,
+		buf,
+		len,
+		USB_TIMEOUT_MS
+	);
+}
+
+/// Returns number of devices registered, or negative error code
+static int usb_spi_register_devices(struct usb_spi_device *usb_spi)
+{
+	int i;
+	int ret;
+	const struct usb_spi_MasterInfo *info;
+
+	ret = usb_spi_control_in(usb_spi, REQUEST_IN_HW_INFO, 0, usb_spi->usb_buffer, sizeof(*info));
+	if (ret < 0) {
+		dev_err(&usb_spi->usb_dev->dev, "Control IN REQUEST_IN_HW_INFO failed %d: %s", ret, error_to_string(ret));
+		return ret;
+	} else if (ret != sizeof(*info)) {
+		dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to REQUEST_IN_HW_INFO", ret);
+		return -EINVAL;
+	}
+
+	info = (const struct usb_spi_MasterInfo *) usb_spi->usb_buffer;
+
+	if (info->hardware != SpiMaster) {
+		dev_err(&usb_spi->usb_dev->dev, "Device isn't an SPI master, unsupported");
+		return -EINVAL;
+	}
+
+	dev_info(&usb_spi->usb_dev->dev, "%d devices connected", info->slave_count); // TODO
+
+	for (i = 0; i < info->slave_count; ++i) {
+		// Slight chicken-and-egg problem here: we need to read in devices to
+		// determine if they provide IRQs, so we don't know how many IRQs to
+		// allocate.
+
+	// spi_new_device(spi_master, spi_board_info);
+	}
+
+	return info->slave_count;
+}
+
 static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_id *id)
 {
 	struct usb_device *usb_dev = NULL;
@@ -51,9 +150,18 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		return -ENOMEM;
 	}
 
+	usb_spi->usb_interface_index = usb_if->cur_altsetting->desc.bInterfaceNumber;
+
+	// TODO make this the largest of the relevant endpoint sizes
+	usb_spi->usb_buffer = kmalloc(64, GFP_KERNEL);
+	if (!usb_spi->usb_buffer) {
+		ret = -ENOMEM;
+		goto err;
+	}
+
 	usb_spi->usb_dev = usb_dev;
 
-	spi_master = spi_alloc_master(&usb_spi->usb_dev->dev, sizeof(usb_spi));
+	spi_master = spi_alloc_master(&usb_dev->dev, sizeof(usb_spi));
 	if (!spi_master) {
 		ret = -ENOMEM;
 		goto err;
@@ -61,7 +169,7 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 
 	spi_master_set_devdata(spi_master, usb_spi);
 
-	// TODO get parameters from the device
+	// TODO get parameters from the device?  Do they matter?
 	spi_master->min_speed_hz = 1000;
 	spi_master->max_speed_hz = 1000;
 
@@ -82,10 +190,19 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 	}
 	usb_spi->spi_master = spi_master;
 
-	dev_info(&usb_spi->usb_dev->dev, "New USP-SPI device %04X:%04X SPI %d",
-	         id->idVendor, id->idProduct, spi_master->bus_num);
+	dev_info(&usb_dev->dev, "USB-SPI device %s %s %s providing SPI %d",
+	         usb_dev->manufacturer, usb_dev->product, usb_dev->serial, spi_master->bus_num);
+
+	ret = usb_spi_register_devices(usb_spi);
+	if (ret < 0) {
+		dev_warn(&usb_dev->dev, "USB-SPI failed to register devices (code %d)", ret);
+		goto err;
+	} else {
+		ret = 0;
+	}
 
 	usb_set_intfdata(usb_if, usb_spi);
+
 	return ret;
 
 err:
@@ -94,6 +211,9 @@ err:
 	}
 	if (usb_spi) {
 		usb_put_dev(usb_spi->usb_dev);
+		if (usb_spi->usb_buffer) {
+			kfree(usb_spi->usb_buffer);
+		}
 		kfree(usb_spi);
 	}
 
@@ -109,6 +229,7 @@ static void usb_spi_disconnect(struct usb_interface *interface)
 	spi_unregister_master(usb_spi->spi_master);
 
 	usb_put_dev(usb_spi->usb_dev);
+	kfree(usb_spi->usb_buffer);
 	kfree(usb_spi);
 }
 

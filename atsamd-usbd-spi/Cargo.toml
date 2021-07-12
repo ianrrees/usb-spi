@@ -26,6 +26,9 @@ path = "/home/irees/Projects/20201112 - atsamd-rs/hal"
 # TODO specify as a minimum version of atsamd-hal once the UARTv2 PR is merged
 features = ["usb"]
 
+[dependencies.usb-spi-protocol]
+path = "../protocol"
+
 [features]
 default = [
     "defmt-default",
