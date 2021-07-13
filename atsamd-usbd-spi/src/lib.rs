@@ -358,7 +358,7 @@ where
         match protocol::ControlIn::n(req.request) {
             Some(protocol::ControlIn::REQUEST_IN_HW_INFO) => {
                 xfer.accept(|buf| 
-                    Ok(protocol::MasterInfo::new(42) // TODO make this dynamic
+                    Ok(protocol::MasterInfo::new(1) // TODO make this dynamic
                        .encode(buf))
                 ).unwrap_or_else(|_| {
                     defmt::error!("USB-SPI Failed to accept REQUEST_IN_HW_INFO")
@@ -368,7 +368,11 @@ where
                 unimplemented!();
             }
             Some(protocol::ControlIn::REQUEST_IN_LINUX_SLAVE_INFO) => {
-                unimplemented!();
+                xfer.accept(|buf| 
+                    Ok(protocol::ConnectedSlaveInfoLinux::new().encode(buf))
+                ).unwrap_or_else(|_| {
+                    defmt::error!("USB-SPI Failed to accept REQUEST_IN_LINUX_SLAVE_INFO")
+                });
             }
             None => {
                 defmt::info!("USB-SPI rejecting control_in request");

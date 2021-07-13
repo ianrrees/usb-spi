@@ -51,12 +51,27 @@ pub struct ConnectedSlaveInfoLinux {
     // TODO
     // pub platform_data_len: u16,
     pub has_interrupt: u8,
-    /// NULL-terminated
+    /// NULL-terminated, 32 comes from Linux's SPI_NAME_SIZE
     pub modalias: [u8; 32],
     // TODO how to encode this in Rust?
     // char platform_data[0],
 
     // Is there any point in passing the mode or speed?
+}
+
+impl ConnectedSlaveInfoLinux {
+    pub fn new() -> Self {
+        Self {
+            has_interrupt: true as u8,
+            modalias: [0; 32],
+        }
+    }
+
+    pub fn encode(&self, buf: &mut [u8]) -> usize {
+        buf[0] = self.has_interrupt;
+        buf[1..82].copy_from_slice("testing with a longer string than will fit in a single transfer given the EP size".as_bytes());
+        82
+    }
 }
 
 #[repr(u8)]

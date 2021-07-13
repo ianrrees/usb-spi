@@ -45,6 +45,17 @@ typedef struct usb_spi_MasterInfo {
   uint16_t slave_count;
 } usb_spi_MasterInfo;
 
+/**
+ * Returned by SPI masters for REQUEST_IN_LINUX_SLAVE_INFO
+ */
+typedef struct usb_spi_ConnectedSlaveInfoLinux {
+  uint8_t has_interrupt;
+  /**
+   * NULL-terminated, 32 comes from Linux's SPI_NAME_SIZE
+   */
+  uint8_t modalias[32];
+} usb_spi_ConnectedSlaveInfoLinux;
+
 typedef struct usb_spi_Event {
   usb_spi_EventType event;
 } usb_spi_Event;

@@ -17,7 +17,7 @@ fn main() {
         // TODO why is this necessary?
         .include_item("HardwareProtocol")
         .include_item("MasterInfo")
-        .include_item("LinuxSlaveInfo")
+        .include_item("ConnectedSlaveInfoLinux")
         .include_item("EventType")
         .include_item("Event")
         .include_item("ControlIn")

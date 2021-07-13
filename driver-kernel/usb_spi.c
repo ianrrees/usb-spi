@@ -25,6 +25,8 @@ struct usb_spi_device {
 	struct usb_device *usb_dev;
 	struct spi_master *spi_master;
 	struct usb_spi_connected_peripheral *connected;
+	struct mutex usb_mutex;
+	size_t usb_buf_sz;
 	u16 usb_interface_index;
 	u16 connected_peripheral_count;
 	u8 *usb_buffer;
@@ -100,35 +102,64 @@ static int usb_spi_register_devices(struct usb_spi_device *usb_spi)
 {
 	int i;
 	int ret;
-	const struct usb_spi_MasterInfo *info;
+	int count;
 
+	const struct usb_spi_MasterInfo *info = NULL;
+
+	mutex_lock(&usb_spi->usb_mutex);
 	ret = usb_spi_control_in(usb_spi, REQUEST_IN_HW_INFO, 0, usb_spi->usb_buffer, sizeof(*info));
 	if (ret < 0) {
 		dev_err(&usb_spi->usb_dev->dev, "Control IN REQUEST_IN_HW_INFO failed %d: %s", ret, error_to_string(ret));
-		return ret;
+		goto err;
 	} else if (ret != sizeof(*info)) {
 		dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to REQUEST_IN_HW_INFO", ret);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err;
 	}
 
 	info = (const struct usb_spi_MasterInfo *) usb_spi->usb_buffer;
 
 	if (info->hardware != SpiMaster) {
 		dev_err(&usb_spi->usb_dev->dev, "Device isn't an SPI master, unsupported");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err;
 	}
 
-	dev_info(&usb_spi->usb_dev->dev, "%d devices connected", info->slave_count); // TODO
+	count = info->slave_count;
+	mutex_unlock(&usb_spi->usb_mutex);
 
-	for (i = 0; i < info->slave_count; ++i) {
+	dev_info(&usb_spi->usb_dev->dev, "%d devices connected:", count); // TODO
+
+	for (i = 0; i < count; ++i) {
 		// Slight chicken-and-egg problem here: we need to read in devices to
 		// determine if they provide IRQs, so we don't know how many IRQs to
-		// allocate.
+		// allocate.  Add an irq_count field, then fetch each?
 
-	// spi_new_device(spi_master, spi_board_info);
+		const struct usb_spi_ConnectedSlaveInfoLinux *slave_info = NULL;
+		// TODO this pattern needs to check the size of the usb_buffer
+		mutex_lock(&usb_spi->usb_mutex);
+		ret = usb_spi_control_in(usb_spi, REQUEST_IN_LINUX_SLAVE_INFO, i, usb_spi->usb_buffer, sizeof(*slave_info));
+		if (ret < 0) {
+			dev_err(&usb_spi->usb_dev->dev, "Control IN REQUEST_IN_LINUX_SLAVE_INFO failed %d: %s", ret, error_to_string(ret));
+			goto err;
+		}
+
+		slave_info = (const struct usb_spi_ConnectedSlaveInfoLinux *) usb_spi->usb_buffer;
+
+		if (slave_info->has_interrupt) {
+			dev_info(&usb_spi->usb_dev->dev, "\t\"%s\", has interrupt", slave_info->modalias);
+		} else {
+			dev_info(&usb_spi->usb_dev->dev, "\t\"%s\"", slave_info->modalias);
+		}
+		mutex_unlock(&usb_spi->usb_mutex);
+
+		// spi_new_device(spi_master, spi_board_info);
 	}
 
-	return info->slave_count;
+	return count;
+err:
+	mutex_unlock(&usb_spi->usb_mutex);
+	return ret;
 }
 
 static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_id *id)
@@ -136,6 +167,8 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 	struct usb_device *usb_dev = NULL;
 	struct usb_spi_device *usb_spi = NULL;
 	struct spi_master *spi_master = NULL;
+	struct usb_endpoint_descriptor *ep_in = NULL;
+	struct usb_endpoint_descriptor *ep_out = NULL;
 	int ret = 0;
 
 	usb_dev = usb_get_dev(interface_to_usbdev(usb_if));
@@ -150,16 +183,28 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		return -ENOMEM;
 	}
 
+	usb_spi->usb_dev = usb_dev;
 	usb_spi->usb_interface_index = usb_if->cur_altsetting->desc.bInterfaceNumber;
 
-	// TODO make this the largest of the relevant endpoint sizes
-	usb_spi->usb_buffer = kmalloc(64, GFP_KERNEL);
+	// Find size of biggest endpoint we'll deal with
+	ret = usb_find_common_endpoints(usb_if->cur_altsetting, &ep_in, &ep_out, NULL, NULL);
+	if (ret) {
+		// TODO Support half-duplex with only one bulk endpoint
+		dev_err(&usb_dev->dev, "Missing/corrupt bulk endpoint descriptors");
+		goto err;
+	}
+
+	usb_spi->usb_buf_sz = (size_t)usb_endpoint_maxp(&usb_dev->ep0.desc);
+	usb_spi->usb_buf_sz = max(usb_spi->usb_buf_sz, (size_t)usb_endpoint_maxp(ep_in));
+	usb_spi->usb_buf_sz = max(usb_spi->usb_buf_sz, (size_t)usb_endpoint_maxp(ep_out));
+
+	usb_spi->usb_buffer = kmalloc(usb_spi->usb_buf_sz, GFP_KERNEL);
 	if (!usb_spi->usb_buffer) {
 		ret = -ENOMEM;
 		goto err;
 	}
 
-	usb_spi->usb_dev = usb_dev;
+	mutex_init(&usb_spi->usb_mutex);
 
 	spi_master = spi_alloc_master(&usb_dev->dev, sizeof(usb_spi));
 	if (!spi_master) {
@@ -195,7 +240,7 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 
 	ret = usb_spi_register_devices(usb_spi);
 	if (ret < 0) {
-		dev_warn(&usb_dev->dev, "USB-SPI failed to register devices (code %d)", ret);
+		// usb_spi_register_devices() emitted an appropriate message
 		goto err;
 	} else {
 		ret = 0;
