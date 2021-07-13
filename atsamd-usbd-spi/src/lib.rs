@@ -395,13 +395,37 @@ where
 
         defmt::info!("USB-SPI got a Control OUT request! {:?}", req.request);
 
-        match req.request {
-            _ => {
-                defmt::info!("USB-SPI rejecting control_out request");
+        match protocol::ControlOut::n(req.request) {
+            Some(protocol::ControlOut::SetSlave) => {
+                match protocol::SetSlave::decode(xfer.data()) {
+                    Some(setting) => {
+                        // TODO actually do something with this
+                        match setting.direction {
+                            protocol::Direction::Miso => {
+                                defmt::info!("MISO only, device {:?}", setting.slave_id);
+                            }
+                            protocol::Direction::Mosi => {
+                                defmt::info!("MOSI only, device {:?}", setting.slave_id);
+                            }
+                            protocol::Direction::Both => {
+                                defmt::info!("Full duplex, device {:?}", setting.slave_id);
+                            }
+                        }
+                    }
+                    None => {
+                        defmt::warn!("USB-SPI rejecting corrupt SetSlave request");
+                        xfer.reject().unwrap_or_else(|_| {
+                            defmt::error!("USB-SPI Failed to reject control OUT request")
+                        });
+                    }
+                }
+            }
+            None => {
+                defmt::warn!("USB-SPI rejecting unknown control_out request {:?}", req.request);
                 xfer.reject().unwrap_or_else(|_| {
                     defmt::error!("USB-SPI Failed to reject control OUT request")
                 });
             }
-        };
+        }
     }
 }

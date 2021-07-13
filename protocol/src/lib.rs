@@ -12,6 +12,7 @@
 
 // TODO SPI mode
 
+use byteorder::{ByteOrder, LittleEndian};
 use enumn::N;
 
 /// Functions as something like a communications protocol version
@@ -50,7 +51,7 @@ impl MasterInfo {
 pub struct ConnectedSlaveInfoLinux {
     // TODO
     // pub platform_data_len: u16,
-    pub has_interrupt: u8,
+    pub has_interrupt: u8, // TODO bitfield
     /// NULL-terminated, 32 comes from Linux's SPI_NAME_SIZE
     pub modalias: [u8; 32],
     // TODO how to encode this in Rust?
@@ -89,6 +90,7 @@ pub struct Event {
 #[derive(Copy, Clone, Debug, N)]
 #[repr(u8)]
 pub enum ControlIn {
+    // TODO rename these to fit Rust conventions
     REQUEST_IN_HW_INFO,
     REQUEST_IN_GET_EVENT,
     /// Slave ID is sent in the value field
@@ -99,8 +101,38 @@ pub enum ControlIn {
 #[derive(Copy, Clone, Debug, N)]
 #[repr(u8)]
 pub enum ControlOut {
-    /// Slave ID is sent in the value field
-    REQUEST_OUT_SET_SLAVE,
+    SetSlave,
+}
+
+#[derive(Copy, Clone, Debug, N)]
+#[repr(u8)]
+pub enum Direction {
+    Miso,
+    Mosi,
+    Both,
+}
+
+#[repr(C)]
+pub struct SetSlave {
+    pub slave_id: u16,
+    pub direction: Direction
+}
+
+impl SetSlave {
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() != 3 {
+            None
+        } else {
+            if let Some(direction) = Direction::n(buf[2]) {
+                Some(Self{
+                    slave_id: LittleEndian::read_u16(&buf[0..2]),
+                    direction
+                })
+            } else {
+                None
+            }
+        }
+    }
 }
 
 #[cfg(test)]

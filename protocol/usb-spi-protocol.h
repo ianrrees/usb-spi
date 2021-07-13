@@ -17,10 +17,7 @@ typedef uint8_t usb_spi_ControlIn;
  * Used as the request field of OUT control transfers
  */
 enum usb_spi_ControlOut {
-  /**
-   * Slave ID is sent in the value field
-   */
-  REQUEST_OUT_SET_SLAVE,
+  SetSlave,
 };
 typedef uint8_t usb_spi_ControlOut;
 

@@ -13,43 +13,24 @@
 
 #define USB_TIMEOUT_MS 1000
 
-struct usb_spi_connected_peripheral {
-	// May not be necessary to store this?
-	char modalias[SPI_NAME_SIZE];
-	// during probe, bool whether the hardware provides an IRQ. Then the IRQ
-	int irq;
-	// TODO platform data
-};
+// struct usb_spi_connected_peripheral {
+// 	// May not be necessary to store this?
+// 	char modalias[SPI_NAME_SIZE];
+// 	// during probe, bool whether the hardware provides an IRQ. Then the IRQ
+// 	int irq;
+// 	// TODO platform data
+// };
 
 struct usb_spi_device {
 	struct usb_device *usb_dev;
 	struct spi_master *spi_master;
-	struct usb_spi_connected_peripheral *connected;
+	// struct usb_spi_connected_peripheral *connected;
 	struct mutex usb_mutex;
 	size_t usb_buf_sz;
 	u16 usb_interface_index;
-	u16 connected_peripheral_count;
-	u8 *usb_buffer;
+	u16 connected_count;
+	u8 *usb_buffer; // Protected by usb_mutex
 };
-
-static int usb_spi_setup(struct spi_device *spi)
-{
-	printk(KERN_INFO "usb_spi_setup()"); // TODO
-	return 0;
-}
-
-static void usb_spi_cleanup(struct spi_device *spi)
-{
-	printk(KERN_INFO "usb_spi_cleanup()"); // TODO
-}
-
-static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_message *mesg)
-{
-	struct usb_spi_device *usb_spi = spi_master_get_devdata(master);
-
-	dev_info(&usb_spi->usb_dev->dev, "usb_spi_transfer_one_message()"); // TODO
-	return 0;
-}
 
 // TODO this is bound to exist somewhere else...
 // Error list is from https://www.kernel.org/doc/html/latest/driver-api/usb/error-codes.html
@@ -81,6 +62,52 @@ static const char * error_to_string(int err)
 	}
 }
 
+/// Called after spi_new_device(), not when a driver attaches
+static int usb_spi_setup(struct spi_device *spi) { return 0; }
+
+/// Called by spi_unregister_master(), not when a driver detaches
+static void usb_spi_cleanup(struct spi_device *spi) { }
+
+static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_message *mesg)
+{
+	struct usb_spi_device *usb_spi = spi_master_get_devdata(master);
+	struct spi_transfer *xfer = NULL;
+	int ret = 0;
+
+	dev_info(&usb_spi->usb_dev->dev, "usb_spi_transfer_one_message() CS:%d",
+	         mesg->spi->chip_select); // TODO
+
+	list_for_each_entry(xfer, &mesg->transfers, transfer_list) {
+		dev_info(&usb_spi->usb_dev->dev, "SPI transfer: %p, %p, %d",
+		        xfer->tx_buf, xfer->rx_buf, xfer->len);
+		if (xfer->bits_per_word != 8) {
+			dev_warn(&usb_spi->usb_dev->dev,
+			         "SPI transfer has %d bits per word, only 8 is supported",
+					 xfer->bits_per_word);
+		}
+
+		// TODO actually make the transfer over USB
+
+		mesg->actual_length += xfer->len;
+	}
+
+	mesg->status = ret;
+	spi_finalize_current_message(master);
+	return ret;
+}
+
+static struct spi_board_info spi_board_info[] = {
+{
+        .modalias       = "spi-test",
+        // .platform_data  = &ads_info,
+        .mode           = SPI_MODE_0,
+        .irq            = 1234,
+        .max_speed_hz   = 120000 /* max sample rate at 3V */ * 16,
+        .bus_num        = 1,
+        .chip_select    = 0,
+},
+};
+
 /// Returns number of bytes transferred, or negative error code
 static int usb_spi_control_in(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
 {
@@ -97,13 +124,10 @@ static int usb_spi_control_in(struct usb_spi_device *usb_spi, u8 request, u16 va
 	);
 }
 
-/// Returns number of devices registered, or negative error code
-static int usb_spi_register_devices(struct usb_spi_device *usb_spi)
+/// Returns 0 on success, or negative error code
+static int usb_spi_get_master_info(struct usb_spi_device *usb_spi)
 {
-	int i;
-	int ret;
-	int count;
-
+	int ret = 0;
 	const struct usb_spi_MasterInfo *info = NULL;
 
 	mutex_lock(&usb_spi->usb_mutex);
@@ -115,6 +139,8 @@ static int usb_spi_register_devices(struct usb_spi_device *usb_spi)
 		dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to REQUEST_IN_HW_INFO", ret);
 		ret = -EINVAL;
 		goto err;
+	} else {
+		ret = 0;
 	}
 
 	info = (const struct usb_spi_MasterInfo *) usb_spi->usb_buffer;
@@ -125,38 +151,8 @@ static int usb_spi_register_devices(struct usb_spi_device *usb_spi)
 		goto err;
 	}
 
-	count = info->slave_count;
-	mutex_unlock(&usb_spi->usb_mutex);
+	usb_spi->connected_count = info->slave_count;
 
-	dev_info(&usb_spi->usb_dev->dev, "%d devices connected:", count); // TODO
-
-	for (i = 0; i < count; ++i) {
-		// Slight chicken-and-egg problem here: we need to read in devices to
-		// determine if they provide IRQs, so we don't know how many IRQs to
-		// allocate.  Add an irq_count field, then fetch each?
-
-		const struct usb_spi_ConnectedSlaveInfoLinux *slave_info = NULL;
-		// TODO this pattern needs to check the size of the usb_buffer
-		mutex_lock(&usb_spi->usb_mutex);
-		ret = usb_spi_control_in(usb_spi, REQUEST_IN_LINUX_SLAVE_INFO, i, usb_spi->usb_buffer, sizeof(*slave_info));
-		if (ret < 0) {
-			dev_err(&usb_spi->usb_dev->dev, "Control IN REQUEST_IN_LINUX_SLAVE_INFO failed %d: %s", ret, error_to_string(ret));
-			goto err;
-		}
-
-		slave_info = (const struct usb_spi_ConnectedSlaveInfoLinux *) usb_spi->usb_buffer;
-
-		if (slave_info->has_interrupt) {
-			dev_info(&usb_spi->usb_dev->dev, "\t\"%s\", has interrupt", slave_info->modalias);
-		} else {
-			dev_info(&usb_spi->usb_dev->dev, "\t\"%s\"", slave_info->modalias);
-		}
-		mutex_unlock(&usb_spi->usb_mutex);
-
-		// spi_new_device(spi_master, spi_board_info);
-	}
-
-	return count;
 err:
 	mutex_unlock(&usb_spi->usb_mutex);
 	return ret;
@@ -206,6 +202,11 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 
 	mutex_init(&usb_spi->usb_mutex);
 
+	ret = usb_spi_get_master_info(usb_spi);
+	if (ret < 0) {
+		goto err;
+	}
+
 	spi_master = spi_alloc_master(&usb_dev->dev, sizeof(usb_spi));
 	if (!spi_master) {
 		ret = -ENOMEM;
@@ -218,8 +219,8 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 	spi_master->min_speed_hz = 1000;
 	spi_master->max_speed_hz = 1000;
 
-	spi_master->bus_num = -1; // dynamic
-	spi_master->num_chipselect = 1; // TODO hook up GPIO
+	spi_master->bus_num = -1; // Kernel should allocate our bus_num
+	spi_master->num_chipselect = usb_spi->connected_count;
 	spi_master->mode_bits = SPI_MODE_0 | SPI_MODE_1 | SPI_MODE_2 | SPI_MODE_3;
 
 	spi_master->flags = 0;
@@ -238,13 +239,32 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 	dev_info(&usb_dev->dev, "USB-SPI device %s %s %s providing SPI %d",
 	         usb_dev->manufacturer, usb_dev->product, usb_dev->serial, spi_master->bus_num);
 
-	ret = usb_spi_register_devices(usb_spi);
-	if (ret < 0) {
-		// usb_spi_register_devices() emitted an appropriate message
-		goto err;
-	} else {
-		ret = 0;
-	}
+
+	// for (i = 0; i < count; ++i) {
+	// 	// Slight chicken-and-egg problem here: we need to read in devices to
+	// 	// determine if they provide IRQs, so we don't know how many IRQs to
+	// 	// allocate.  Add an irq_count field, then fetch each?
+
+	// 	const struct usb_spi_ConnectedSlaveInfoLinux *slave_info = NULL;
+	// 	// TODO this pattern needs to check the size of the usb_buffer
+	// 	mutex_lock(&usb_spi->usb_mutex);
+	// 	ret = usb_spi_control_in(usb_spi, REQUEST_IN_LINUX_SLAVE_INFO, i, usb_spi->usb_buffer, sizeof(*slave_info));
+	// 	if (ret < 0) {
+	// 		dev_err(&usb_spi->usb_dev->dev, "Control IN REQUEST_IN_LINUX_SLAVE_INFO failed %d: %s", ret, error_to_string(ret));
+	// 		goto err;
+	// 	}
+
+	// 	slave_info = (const struct usb_spi_ConnectedSlaveInfoLinux *) usb_spi->usb_buffer;
+
+	// 	if (slave_info->has_interrupt) {
+	// 		dev_info(&usb_spi->usb_dev->dev, "\t\"%s\", has interrupt", slave_info->modalias);
+	// 	} else {
+	// 		dev_info(&usb_spi->usb_dev->dev, "\t\"%s\"", slave_info->modalias);
+	// 	}
+	// 	mutex_unlock(&usb_spi->usb_mutex);
+
+		spi_new_device(spi_master, spi_board_info);
+	// }
 
 	usb_set_intfdata(usb_if, usb_spi);
 
@@ -269,9 +289,9 @@ static void usb_spi_disconnect(struct usb_interface *interface)
 {
 	struct usb_spi_device *usb_spi = usb_get_intfdata(interface);
 
-	dev_info(&usb_spi->usb_dev->dev, "USB-SPI disconnected");
-
 	spi_unregister_master(usb_spi->spi_master);
+
+	dev_info(&usb_spi->usb_dev->dev, "USB-SPI disconnected");
 
 	usb_put_dev(usb_spi->usb_dev);
 	kfree(usb_spi->usb_buffer);
