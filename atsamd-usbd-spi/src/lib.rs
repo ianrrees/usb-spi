@@ -10,7 +10,11 @@ use atsamd_hal::{
         Write,
     },
     prelude::*,
+    sercom::v2::spi::{
+        Config, EightBit, Master, Rx, Spi, Tx, ValidPads,
+    },
     time::Hertz,
+    typelevel::NoneT,
 };
 
 // TODO use const generics, so our customers don't need to see this
@@ -53,9 +57,10 @@ impl UsbSpiStorage {
 }
 
 /// A USB CDC to SPI
-pub struct UsbSpi<'a, B, const ENDPOINT_SIZE: usize>
+pub struct UsbSpi<'a, B, P, const ENDPOINT_SIZE: usize>
 where
     B: UsbBus,
+    P: ValidPads<SS = NoneT> + Tx + Rx,
 {
     usb_interface: InterfaceNumber,
     read_endpoint: EndpointOut<'a, B>,
@@ -74,6 +79,9 @@ where
     usb_to_uart_consumer: Consumer<'a, U256>,
 
     write_state: WriteState,
+
+    /// The enabled SPI hardware
+    spi: Spi<Config<P, Master, EightBit>>,
 }
 
 /// If this many full size packets have been sent in a row, a short packet will
@@ -93,16 +101,20 @@ enum WriteState {
     Full(usize),
 }
 
-impl<'a, B, const ENDPOINT_SIZE: usize> UsbSpi<'a, B, ENDPOINT_SIZE>
+impl<'a, B, P, const ENDPOINT_SIZE: usize> UsbSpi<'a, B, P, ENDPOINT_SIZE>
 where
     B: UsbBus,
+    P: ValidPads<SS = NoneT> + Tx + Rx,
 {
     pub fn new(
         alloc: &'a UsbBusAllocator<B>,
         storage: &'a UsbSpiStorage,
+        spi_hardware: Config<P, Master, EightBit>,
     ) -> Self {
         let (uart_to_usb_producer, uart_to_usb_consumer) = storage.rx_buffer.try_split().unwrap();
         let (usb_to_uart_producer, usb_to_uart_consumer) = storage.tx_buffer.try_split().unwrap();
+
+        let spi = spi_hardware.enable();
 
         Self {
             usb_interface: alloc.interface(),
@@ -115,6 +127,8 @@ where
             usb_to_uart_consumer,
 
             write_state: WriteState::NotFull,
+
+            spi,
         }
     }
 
@@ -281,9 +295,10 @@ where
     }
 }
 
-impl<B, const ENDPOINT_SIZE: usize> UsbClass<B> for UsbSpi<'_, B, ENDPOINT_SIZE>
+impl<B, P, const ENDPOINT_SIZE: usize> UsbClass<B> for UsbSpi<'_, B, P, ENDPOINT_SIZE>
 where
     B: UsbBus,
+    P: ValidPads<SS = NoneT> + Tx + Rx,
 {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> Result<()> {
         writer.interface(

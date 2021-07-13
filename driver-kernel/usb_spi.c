@@ -62,11 +62,22 @@ static const char * error_to_string(int err)
 	}
 }
 
-/// Called after spi_new_device(), not when a driver attaches
-static int usb_spi_setup(struct spi_device *spi) { return 0; }
+// Called after spi_new_device(), not when a driver attaches
+static int usb_spi_setup(struct spi_device *spi)
+{
+	struct usb_spi_device *usb_spi = spi_master_get_devdata(spi->master);
+	dev_info(&usb_spi->usb_dev->dev, "usb_spi_setup() for %s on CS %d",
+	         spi->modalias, spi->chip_select);
+	return 0;
+}
 
-/// Called by spi_unregister_master(), not when a driver detaches
-static void usb_spi_cleanup(struct spi_device *spi) { }
+// Called by spi_unregister_master(), not when a driver detaches
+static void usb_spi_cleanup(struct spi_device *spi)
+{
+	struct usb_spi_device *usb_spi = spi_master_get_devdata(spi->master);
+	dev_info(&usb_spi->usb_dev->dev, "usb_spi_cleanup() for %s on CS %d",
+	         spi->modalias, spi->chip_select);
+}
 
 static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_message *mesg)
 {
@@ -78,7 +89,7 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 	         mesg->spi->chip_select); // TODO
 
 	list_for_each_entry(xfer, &mesg->transfers, transfer_list) {
-		dev_info(&usb_spi->usb_dev->dev, "SPI transfer: %p, %p, %d",
+		dev_info(&usb_spi->usb_dev->dev, "SPI transfer: 0x%p, 0x%p, len %d",
 		        xfer->tx_buf, xfer->rx_buf, xfer->len);
 		if (xfer->bits_per_word != 8) {
 			dev_warn(&usb_spi->usb_dev->dev,
