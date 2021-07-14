@@ -48,7 +48,7 @@ typedef struct usb_spi_MasterInfo {
 typedef struct usb_spi_ConnectedSlaveInfoLinux {
   uint8_t has_interrupt;
   /**
-   * NULL-terminated, 32 comes from Linux's SPI_NAME_SIZE
+   * NULL-terminated, 32 comes from Linux's SPI_NAME_SIZE TODO use const
    */
   uint8_t modalias[32];
 } usb_spi_ConnectedSlaveInfoLinux;

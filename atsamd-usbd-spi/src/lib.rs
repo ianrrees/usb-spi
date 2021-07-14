@@ -4,10 +4,13 @@ extern crate atsamd_hal;
 extern crate defmt_rtt;
 
 use atsamd_hal::{
-    hal::serial::{
-        // embedded_hal serial traits
-        Read,
-        Write,
+    gpio::v2::*,
+    hal::{ // embedded_hal traits
+        digital::v2::OutputPin,
+        serial::{
+            Read,
+            Write,
+        }
     },
     prelude::*,
     sercom::v2::spi::{
@@ -26,12 +29,50 @@ use core::convert::TryInto;
 use usb_device::{class_prelude::*, Result};
 use usb_spi_protocol as protocol;
 
-/// This should be used as `device_class` when building the `UsbDevice`.
-pub const USB_CLASS_CDC: u8 = 0x02;
-
 const USB_CLASS_VENDOR_SPECIFIC: u8 = 0xFF; // TODO push up to a protocol crate
 const USB_SUBCLASS_VENDOR_SPECIFIC_USB_SPI: u8 = 0x02; // TODO push up to a protocol crate
 const USB_SPI_PROTOCOL_0: u8 = 0x00; // TODO push up to a protocol crate
+
+/// Describes an SPI-connected peripheral device
+///
+/// This is a trait because the chip select handling might be more complicated
+/// than toggling a GPIO pin, and because we might support passing a device-
+/// specific struct up to the device's driver on the USB host.
+pub trait SpiDevice {
+    /// Assert the device's chip select
+    fn select(&mut self);
+
+    /// Deassert the device's chip select
+    fn deselect(&mut self);
+
+    /// modalias is how Linux SPI drivers associate devices with controllers
+    fn modalias(&self) -> &'static str;
+}
+
+// TODO add interrupt
+pub struct BasicSpiDevice<P: AnyPin<Mode = PushPullOutput>> {
+    pub modalias: Option<&'static str>,
+
+    pub cs_pin: P,
+}
+
+impl <P: AnyPin<Mode = PushPullOutput> + OutputPin> SpiDevice for BasicSpiDevice<P> {
+    fn select(&mut self) {
+        defmt::info!("In BasicSpiDevice::select() for {:?}", self.modalias); // TODO
+        self.cs_pin.set_low().ok().unwrap();
+    }
+
+    fn deselect(&mut self) {
+        defmt::info!("In BasicSpiDevice::deselect() for {:?}", self.modalias); // TODO
+        self.cs_pin.set_high().ok().unwrap();
+    }
+
+    fn modalias(&self) -> &'static str {
+        self.modalias.unwrap_or("")
+    }
+}
+
+pub type SpiDeviceList<'a> = [&'a mut dyn SpiDevice];
 
 /// TX and RX buffers used by the UsbSpi
 ///
@@ -57,7 +98,7 @@ impl UsbSpiStorage {
 }
 
 /// A USB CDC to SPI
-pub struct UsbSpi<'a, B, P, const ENDPOINT_SIZE: usize>
+pub struct UsbSpi<'a, B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize>
 where
     B: UsbBus,
     P: ValidPads<SS = NoneT> + Tx + Rx,
@@ -82,6 +123,11 @@ where
 
     /// The enabled SPI hardware
     spi: Spi<Config<P, Master, EightBit>>,
+
+    devices: [&'a mut dyn SpiDevice; DEVICE_COUNT],
+
+    // Index in to Self.devices, of the currently-selected device
+    selected_device: Option<usize>,
 }
 
 /// If this many full size packets have been sent in a row, a short packet will
@@ -101,7 +147,7 @@ enum WriteState {
     Full(usize),
 }
 
-impl<'a, B, P, const ENDPOINT_SIZE: usize> UsbSpi<'a, B, P, ENDPOINT_SIZE>
+impl<'a, B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize> UsbSpi<'a, B, P, DEVICE_COUNT, ENDPOINT_SIZE>
 where
     B: UsbBus,
     P: ValidPads<SS = NoneT> + Tx + Rx,
@@ -110,6 +156,7 @@ where
         alloc: &'a UsbBusAllocator<B>,
         storage: &'a UsbSpiStorage,
         spi_hardware: Config<P, Master, EightBit>,
+        devices: [&'a mut dyn SpiDevice; DEVICE_COUNT],
     ) -> Self {
         let (uart_to_usb_producer, uart_to_usb_consumer) = storage.rx_buffer.try_split().unwrap();
         let (usb_to_uart_producer, usb_to_uart_consumer) = storage.tx_buffer.try_split().unwrap();
@@ -129,6 +176,8 @@ where
             write_state: WriteState::NotFull,
 
             spi,
+            devices,
+            selected_device: None,
         }
     }
 
@@ -293,9 +342,22 @@ where
 
         self.flush_spi();
     }
+
+    pub fn select(&mut self, device_index: Option<usize>) {
+        // TODO we'll want a mutex or similar to select this, due to deselect when finishing a transaction
+        if device_index != self.selected_device {
+            if let Some(index) = self.selected_device {
+                self.devices[index].deselect();
+            }
+            if let Some(index) = device_index {
+                self.devices[index].select();
+            }
+            self.selected_device = device_index;
+        }
+    }
 }
 
-impl<B, P, const ENDPOINT_SIZE: usize> UsbClass<B> for UsbSpi<'_, B, P, ENDPOINT_SIZE>
+impl<B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize> UsbClass<B> for UsbSpi<'_, B, P, DEVICE_COUNT, ENDPOINT_SIZE>
 where
     B: UsbBus,
     P: ValidPads<SS = NoneT> + Tx + Rx,
@@ -367,8 +429,8 @@ where
             return;
         }
             
-        defmt::info!("USB-SPI interface {:?} Control IN vendor:{:?} interface:{:?} request:{:?}",
-            u8::from(self.usb_interface), req.request_type == control::RequestType::Vendor, req.index, req.request);
+        defmt::info!("USB-SPI interface {:?} Control IN vendor:{:?} interface:{:?} request:{:?} value:{:?}",
+            u8::from(self.usb_interface), req.request_type == control::RequestType::Vendor, req.index, req.request, req.value);
 
         match protocol::ControlIn::n(req.request) {
             Some(protocol::ControlIn::REQUEST_IN_HW_INFO) => {
@@ -383,11 +445,19 @@ where
                 unimplemented!();
             }
             Some(protocol::ControlIn::REQUEST_IN_LINUX_SLAVE_INFO) => {
-                xfer.accept(|buf| 
-                    Ok(protocol::ConnectedSlaveInfoLinux::new().encode(buf))
-                ).unwrap_or_else(|_| {
-                    defmt::error!("USB-SPI Failed to accept REQUEST_IN_LINUX_SLAVE_INFO")
-                });
+                let i = usize::from(req.value);
+                if i < self.devices.len() {
+                    xfer.accept(|buf|
+                        Ok(protocol::ConnectedSlaveInfoLinux::new(false, self.devices[i].modalias()).encode(buf))
+                    ).unwrap_or_else(|_| {
+                        defmt::error!("USB-SPI Failed to accept REQUEST_IN_LINUX_SLAVE_INFO")
+                    });
+                } else {
+                    defmt::info!("USB-SPI rejecting out-of-range REQUEST_IN_LINUX_SLAVE_INFO");
+                    xfer.reject().unwrap_or_else(|_| {
+                        defmt::error!("USB-SPI Failed to reject control IN request")
+                    });
+                }
             }
             None => {
                 defmt::info!("USB-SPI rejecting control_in request");
@@ -414,18 +484,29 @@ where
             Some(protocol::ControlOut::SetSlave) => {
                 match protocol::SetSlave::decode(xfer.data()) {
                     Some(setting) => {
-                        // TODO actually do something with this
-                        match setting.direction {
-                            protocol::Direction::Miso => {
-                                defmt::info!("MISO only, device {:?}", setting.slave_id);
+                        let device_index = usize::from(setting.slave_id);
+                        if device_index < self.devices.len() {
+                            self.select(Some(device_index));
+                            
+                            // TODO actually do something with this
+                            match setting.direction {
+                                protocol::Direction::Miso => {
+                                    defmt::info!("MISO only, device {:?}", setting.slave_id);
+                                }
+                                protocol::Direction::Mosi => {
+                                    defmt::info!("MOSI only, device {:?}", setting.slave_id);
+                                }
+                                protocol::Direction::Both => {
+                                    defmt::info!("Full duplex, device {:?}", setting.slave_id);
+                                }
                             }
-                            protocol::Direction::Mosi => {
-                                defmt::info!("MOSI only, device {:?}", setting.slave_id);
-                            }
-                            protocol::Direction::Both => {
-                                defmt::info!("Full duplex, device {:?}", setting.slave_id);
-                            }
+                        } else {
+                            defmt::info!("USB-SPI rejecting out-of-range SetSlave request");
+                            xfer.reject().unwrap_or_else(|_| {
+                                defmt::error!("USB-SPI Failed to reject control OUT request")
+                            });
                         }
+                        
                     }
                     None => {
                         defmt::warn!("USB-SPI rejecting corrupt SetSlave request");

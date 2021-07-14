@@ -52,7 +52,7 @@ pub struct ConnectedSlaveInfoLinux {
     // TODO
     // pub platform_data_len: u16,
     pub has_interrupt: u8, // TODO bitfield
-    /// NULL-terminated, 32 comes from Linux's SPI_NAME_SIZE
+    /// NULL-terminated, 32 comes from Linux's SPI_NAME_SIZE TODO use const
     pub modalias: [u8; 32],
     // TODO how to encode this in Rust?
     // char platform_data[0],
@@ -61,16 +61,24 @@ pub struct ConnectedSlaveInfoLinux {
 }
 
 impl ConnectedSlaveInfoLinux {
-    pub fn new() -> Self {
+    pub fn new(has_interrupt: bool, modalias: &'static str) -> Self {
+        let mut modalias_arr = [0; 32];
+        if modalias.len() < 32 {
+            modalias_arr[0..modalias.len()].copy_from_slice(modalias.as_bytes());
+        } else {
+            // defmt::warn!("Truncating {:?}", modalias);
+            modalias_arr.copy_from_slice(&modalias.as_bytes()[..32]);
+        }
+
         Self {
-            has_interrupt: true as u8,
-            modalias: [0; 32],
+            has_interrupt: has_interrupt as u8,
+            modalias: modalias_arr,
         }
     }
 
     pub fn encode(&self, buf: &mut [u8]) -> usize {
         buf[0] = self.has_interrupt;
-        buf[1..82].copy_from_slice("testing with a longer string than will fit in a single transfer given the EP size".as_bytes());
+        buf[1..33].copy_from_slice(&self.modalias);
         82
     }
 }
