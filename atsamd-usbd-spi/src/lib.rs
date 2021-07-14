@@ -14,7 +14,7 @@ use atsamd_hal::{
     },
     prelude::*,
     sercom::v2::spi::{
-        Config, EightBit, Master, Rx, Spi, Tx, ValidPads,
+        Config, EightBit, Flags, Master, Rx, Spi, Tx, ValidPads,
     },
     time::Hertz,
     typelevel::NoneT,
@@ -22,6 +22,7 @@ use atsamd_hal::{
 
 // TODO use const generics, so our customers don't need to see this
 pub use bbqueue::consts::*;
+use typenum::marker_traits::Unsigned; // Also get rid of this dependency
 
 // See note in Cargo.toml as to why this not heapless
 use bbqueue::{BBBuffer, Consumer, Error as BBError, Producer};
@@ -74,6 +75,8 @@ impl <P: AnyPin<Mode = PushPullOutput> + OutputPin> SpiDevice for BasicSpiDevice
 
 pub type SpiDeviceList<'a> = [&'a mut dyn SpiDevice];
 
+type BufferSize = U256;
+
 /// TX and RX buffers used by the UsbSpi
 ///
 /// Due to the BBQueue API, combined with Rust's rules about structs that
@@ -82,10 +85,10 @@ pub type SpiDeviceList<'a> = [&'a mut dyn SpiDevice];
 /// memory once it's in use, because any outstanding grant from before the move
 /// would point to memory which is no longer inside the buffer.
 pub struct UsbSpiStorage {
-    /// For data from the UART to the USB; from the DCE to DTE, device to host
-    rx_buffer: BBBuffer<U256>,
+    /// For data from the SPI to the USB; from the DCE to DTE, device to host
+    rx_buffer: BBBuffer<BufferSize>,
     /// Other direction from `rx_buffer`
-    tx_buffer: BBBuffer<U256>,
+    tx_buffer: BBBuffer<BufferSize>,
 }
 
 impl UsbSpiStorage {
@@ -95,39 +98,6 @@ impl UsbSpiStorage {
             tx_buffer: BBBuffer::new(),
         }
     }
-}
-
-/// A USB CDC to SPI
-pub struct UsbSpi<'a, B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize>
-where
-    B: UsbBus,
-    P: ValidPads<SS = NoneT> + Tx + Rx,
-{
-    usb_interface: InterfaceNumber,
-    read_endpoint: EndpointOut<'a, B>,
-    write_endpoint: EndpointIn<'a, B>,
-
-    /// UART end of the UART->USB buffer
-    uart_to_usb_producer: Producer<'a, U256>,
-
-    /// USB end of the UART->USB buffer
-    uart_to_usb_consumer: Consumer<'a, U256>,
-
-    /// USB end of the USB->UART buffer
-    usb_to_uart_producer: Producer<'a, U256>,
-
-    /// UART end of the USB->UART buffer
-    usb_to_uart_consumer: Consumer<'a, U256>,
-
-    write_state: WriteState,
-
-    /// The enabled SPI hardware
-    spi: Spi<Config<P, Master, EightBit>>,
-
-    devices: [&'a mut dyn SpiDevice; DEVICE_COUNT],
-
-    // Index in to Self.devices, of the currently-selected device
-    selected_device: Option<usize>,
 }
 
 /// If this many full size packets have been sent in a row, a short packet will
@@ -147,6 +117,39 @@ enum WriteState {
     Full(usize),
 }
 
+/// A USB CDC to SPI
+pub struct UsbSpi<'a, B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize>
+where
+    B: UsbBus,
+    P: ValidPads<SS = NoneT> + Tx + Rx,
+{
+    usb_interface: InterfaceNumber,
+    read_endpoint: EndpointOut<'a, B>,
+    write_endpoint: EndpointIn<'a, B>,
+
+    /// SPI end of the SPI->USB buffer
+    spi_to_usb_producer: Producer<'a, BufferSize>,
+
+    /// USB end of the SPI->USB buffer
+    spi_to_usb_consumer: Consumer<'a, BufferSize>,
+
+    /// USB end of the USB->SPI buffer
+    usb_to_spi_producer: Producer<'a, BufferSize>,
+
+    /// SPI end of the USB->SPI buffer
+    usb_to_spi_consumer: Consumer<'a, BufferSize>,
+
+    write_state: WriteState,
+
+    /// The enabled SPI hardware
+    spi: Spi<Config<P, Master, EightBit>>,
+
+    devices: [&'a mut dyn SpiDevice; DEVICE_COUNT],
+
+    // Index in to Self.devices, of the currently-selected device
+    selected_device: Option<usize>,
+}
+
 impl<'a, B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize> UsbSpi<'a, B, P, DEVICE_COUNT, ENDPOINT_SIZE>
 where
     B: UsbBus,
@@ -158,20 +161,21 @@ where
         spi_hardware: Config<P, Master, EightBit>,
         devices: [&'a mut dyn SpiDevice; DEVICE_COUNT],
     ) -> Self {
-        let (uart_to_usb_producer, uart_to_usb_consumer) = storage.rx_buffer.try_split().unwrap();
-        let (usb_to_uart_producer, usb_to_uart_consumer) = storage.tx_buffer.try_split().unwrap();
+        let (spi_to_usb_producer, spi_to_usb_consumer) = storage.rx_buffer.try_split().unwrap();
+        let (usb_to_spi_producer, usb_to_spi_consumer) = storage.tx_buffer.try_split().unwrap();
 
-        let spi = spi_hardware.enable();
+        let mut spi = spi_hardware.enable();
+        spi.enable_interrupts(Flags::TXC);
 
         Self {
             usb_interface: alloc.interface(),
             read_endpoint: alloc.bulk(ENDPOINT_SIZE as u16),
             write_endpoint: alloc.bulk(ENDPOINT_SIZE as u16),
 
-            uart_to_usb_producer,
-            uart_to_usb_consumer,
-            usb_to_uart_producer,
-            usb_to_uart_consumer,
+            spi_to_usb_producer,
+            spi_to_usb_consumer,
+            usb_to_spi_producer,
+            usb_to_spi_consumer,
 
             write_state: WriteState::NotFull,
 
@@ -183,7 +187,7 @@ where
 
     // TODO perhaps a better name
     pub fn flush_usb(&mut self) {
-        match self.uart_to_usb_consumer.read() {
+        match self.spi_to_usb_consumer.read() {
             // There is more data to write
             Ok(grant) => {
                 // Deciding what to write is a bit more complicated,
@@ -252,39 +256,39 @@ where
 
             Err(_) => {
                 // TODO handle this better
-                defmt::error!("Couldn't get uart_to_usb_consumer grant");
+                defmt::error!("Couldn't get spi_to_usb_consumer grant");
                 // Ok(())
             }
         }
     }
 
     // TODO perhaps a better name
-    /// Attempts to write a byte out to the UART
+    /// Attempts to write a out over SPI
     fn flush_spi(&mut self) {
         // Try to send the next available byte
-        match self.usb_to_uart_consumer.read() {
+        match self.usb_to_spi_consumer.read() {
             Ok(grant) => {
-                // // The buffer returned is guaranteed to have at least one byte
-                // // write() clears the TXC flag if it's set
-                // match self.uart.write(grant.buf()[0]) {
-                //     // '+'
-                //     Ok(()) => {
-                //         grant.release(1);
-                //     }
-                //     Err(nb::Error::WouldBlock) => {
-                //         // UART isn't ready for the next byte
-                //     }
-                //     Err(_) => {
-                //         defmt::error!("error in flush_spi()"); // TODO
-                //     }
-                // };
+                defmt::info!("sending {:?}", grant.buf()[0]); // TODO
+                // The buffer returned is guaranteed to have at least one byte
+                match self.spi.send(grant.buf()[0]) {
+                    // '+'
+                    Ok(()) => {
+                        grant.release(1);
+                    }
+                    Err(nb::Error::WouldBlock) => {
+                        // SPI isn't ready for the next byte
+                    }
+                    Err(_) => {
+                        defmt::error!("error in flush_spi()"); // TODO
+                    }
+                };
             }
             Err(BBError::InsufficientSize) => {
                 // // There's no more data in the buffer to write
                 // self.uart.clear_flags(Flags::TXC);
             }
             Err(BBError::GrantInProgress) => {
-                // We'll hit this when the USB or UART ISR interrupts the other;
+                // We'll hit this when the USB or SPI ISR interrupts the other;
                 // it's effectively a mutex that protects the uart_tx
             }
             Err(BBError::AlreadySplit) => {
@@ -295,7 +299,8 @@ where
 
     // TODO split this in to another struct so users don't need two ISRs that both reference Self
     pub fn spi_callback(&mut self) {
-        // match self.uart_to_usb_producer.grant_exact(1) {
+        defmt::info!("In spi_callback()");
+        // match self.spi_to_usb_producer.grant_exact(1) {
         //     Ok(mut grant) => {
         //         match self.uart.read() {
         //             Ok(c) => {
@@ -308,25 +313,25 @@ where
         //             }
         //             Err(nb::Error::Other(error)) => {
         //                 match error {
-        //                     // TODO the CDC standard probably has a way to report these
+            // TODO blindly find-and-replaced from USB-UART
         //                     Error::ParityError => {
-        //                         defmt::error!("UART RX ParityError");
+        //                         defmt::error!("SPI RX ParityError");
         //                         self.uart.clear_status(Status::PERR);
         //                     }
         //                     Error::FrameError => {
-        //                         defmt::error!("UART RX FrameError");
+        //                         defmt::error!("SPI RX FrameError");
         //                         self.uart.clear_status(Status::FERR);
         //                     }
         //                     Error::Overflow => {
-        //                         defmt::error!("UART RX Overflow");
+        //                         defmt::error!("SPI RX Overflow");
         //                         self.uart.clear_status(Status::BUFOVF);
         //                     }
         //                     Error::InconsistentSyncField => {
-        //                         defmt::error!("UART RX InconsistentSyncField");
+        //                         defmt::error!("SPI RX InconsistentSyncField");
         //                         self.uart.clear_status(Status::ISF);
         //                     }
         //                     Error::CollisionDetected => {
-        //                         defmt::error!("UART RX CollisionDetected");
+        //                         defmt::error!("SPI RX CollisionDetected");
         //                         self.uart.clear_status(Status::COLL);
         //                     }
         //                 }
@@ -335,7 +340,7 @@ where
         //     }
 
         //     Err(_) => {
-        //         // No room in the uart_to_usb buffer
+        //         // No room in the spi_to_usb buffer
         //         // TODO ensure that the DTR does what it's supposed to in this case
         //     }
         // }
@@ -384,14 +389,36 @@ where
     }
 
     fn poll(&mut self) {
-        // See if the host has more data to send over the UART
-        match self.usb_to_uart_producer.grant_exact(ENDPOINT_SIZE) {
+        // Make sure we've got space to store new data, because once the
+        // endpoint is read, the host can overwrite whatever data is in it.
+        match self.usb_to_spi_producer.grant_exact(ENDPOINT_SIZE) {
             Ok(mut grant) => {
-                match self.read_endpoint.read(grant.buf()) {
+                // TODO this is super inefficient...
+                let mut buf = [0u8; ENDPOINT_SIZE];
+                match self.read_endpoint.read(&mut buf) {
                     Ok(count) => {
-                        grant.commit(count);
-                        // TODO note this is only reliable if the UART ISR is higher prio than USB; may be better to put that flag back...
-                        self.flush_spi(); // NOP if the UART is already busy
+                        if let Some(header) = protocol::TransferHeader::decode(&buf[..count]) {
+                            defmt::info!("Read header, {:?}B", header.bytes);
+                            let header_len = core::mem::size_of::<protocol::TransferHeader>();
+                            let data_size = count - header_len;
+
+                            // TODO set some sort of state with the count specified in the header
+
+                            match header.direction {
+                                protocol::Direction::OutOnly | protocol::Direction::Both => {
+                                    grant.buf()[0..data_size].copy_from_slice(&buf[header_len..count]);
+                                    grant.commit(data_size);
+
+                                    defmt::info!("Out {:?}B", data_size);
+                                }
+                                protocol::Direction::InOnly => {
+                                    defmt::info!("In {:?}B", data_size);
+                                }
+                            }
+                            // TODO handle
+                            // grant.commit(count);
+                        }
+                        self.flush_spi(); // NOP if the SPI is already busy
                     }
                     Err(UsbError::WouldBlock) => {
                         // No data to read, just drop the grant
@@ -400,7 +427,7 @@ where
                         // TODO handle this better
                         defmt::error!("Error reading TX data");
                     }
-                };
+                }
             }
             Err(_) => {
                 // Since we don't have anywhere to put more data, we can't read
@@ -429,13 +456,13 @@ where
             return;
         }
             
-        defmt::info!("USB-SPI interface {:?} Control IN vendor:{:?} interface:{:?} request:{:?} value:{:?}",
-            u8::from(self.usb_interface), req.request_type == control::RequestType::Vendor, req.index, req.request, req.value);
+        // defmt::info!("USB-SPI interface {:?} Control IN vendor:{:?} interface:{:?} request:{:?} value:{:?}",
+        //     u8::from(self.usb_interface), req.request_type == control::RequestType::Vendor, req.index, req.request, req.value);
 
         match protocol::ControlIn::n(req.request) {
             Some(protocol::ControlIn::REQUEST_IN_HW_INFO) => {
                 xfer.accept(|buf| 
-                    Ok(protocol::MasterInfo::new(1) // TODO make this dynamic
+                    Ok(protocol::MasterInfo::new(self.devices.len() as u16, BufferSize::to_u16())
                        .encode(buf))
                 ).unwrap_or_else(|_| {
                     defmt::error!("USB-SPI Failed to accept REQUEST_IN_HW_INFO")
@@ -487,26 +514,12 @@ where
                         let device_index = usize::from(setting.slave_id);
                         if device_index < self.devices.len() {
                             self.select(Some(device_index));
-                            
-                            // TODO actually do something with this
-                            match setting.direction {
-                                protocol::Direction::Miso => {
-                                    defmt::info!("MISO only, device {:?}", setting.slave_id);
-                                }
-                                protocol::Direction::Mosi => {
-                                    defmt::info!("MOSI only, device {:?}", setting.slave_id);
-                                }
-                                protocol::Direction::Both => {
-                                    defmt::info!("Full duplex, device {:?}", setting.slave_id);
-                                }
-                            }
                         } else {
                             defmt::info!("USB-SPI rejecting out-of-range SetSlave request");
                             xfer.reject().unwrap_or_else(|_| {
                                 defmt::error!("USB-SPI Failed to reject control OUT request")
                             });
                         }
-                        
                     }
                     None => {
                         defmt::warn!("USB-SPI rejecting corrupt SetSlave request");

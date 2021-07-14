@@ -21,6 +21,20 @@ enum usb_spi_ControlOut {
 };
 typedef uint8_t usb_spi_ControlOut;
 
+/**
+ * USB convention of the directions used in this transfer
+ *
+ * USB is used because the protocol could be used for attaching SPI controllers
+ * or peripherals, but the logic around headers going in OUT transfer wouldn't
+ * change based on the SPI direction.
+ */
+enum usb_spi_Direction {
+  OutOnly,
+  InOnly,
+  Both,
+};
+typedef uint8_t usb_spi_Direction;
+
 enum usb_spi_EventType {
   NONE,
 };
@@ -40,6 +54,10 @@ typedef struct usb_spi_MasterInfo {
    */
   usb_spi_HardwareType hardware;
   uint16_t slave_count;
+  /**
+   * Bytes that can be read in by the SPI before USB IN transfers start
+   */
+  uint16_t in_buf_size;
 } usb_spi_MasterInfo;
 
 /**
@@ -56,3 +74,11 @@ typedef struct usb_spi_ConnectedSlaveInfoLinux {
 typedef struct usb_spi_Event {
   usb_spi_EventType event;
 } usb_spi_Event;
+
+/**
+ * Sent through the bulk OUT endpoint, possibly before any OUT data
+ */
+typedef struct usb_spi_TransferHeader {
+  uint16_t bytes;
+  usb_spi_Direction direction;
+} usb_spi_TransferHeader;

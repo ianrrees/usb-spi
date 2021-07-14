@@ -27,13 +27,16 @@ pub struct MasterInfo {
     /// Encode as SpiMaster
     hardware: HardwareType,
     slave_count: u16,
+    /// Bytes that can be read in by the SPI before USB IN transfers start
+    in_buf_size: u16,
 }
 
 impl MasterInfo {
-    pub fn new(slave_count: u16) -> Self {
+    pub fn new(slave_count: u16, in_buf_size: u16) -> Self {
         Self {
             hardware: HardwareType::SpiMaster,
             slave_count,
+            in_buf_size,
         }
     }
     
@@ -42,7 +45,8 @@ impl MasterInfo {
         buf[0] = self.hardware as u8;
         // pad byte
         buf[2..4].copy_from_slice(&self.slave_count.to_le_bytes());
-        4 // Length
+        buf[4..6].copy_from_slice(&self.in_buf_size.to_le_bytes());
+        6 // Length
     }
 }
 
@@ -112,33 +116,60 @@ pub enum ControlOut {
     SetSlave,
 }
 
+/// USB convention of the directions used in this transfer
+///
+/// USB is used because the protocol could be used for attaching SPI controllers
+/// or peripherals, but the logic around headers going in OUT transfer wouldn't
+/// change based on the SPI direction.
 #[derive(Copy, Clone, Debug, N)]
 #[repr(u8)]
 pub enum Direction {
-    Miso,
-    Mosi,
+    OutOnly,
+    InOnly,
     Both,
 }
 
+/// Sent through the bulk OUT endpoint, possibly before any OUT data
+#[repr(C)]
+pub struct TransferHeader {
+    pub bytes: u16,
+    pub direction: Direction,
+}
+
+impl TransferHeader {
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() <3 { // Not !=, because data often follows
+            None
+        } else {
+            match Direction::n(buf[2]) {
+                Some(direction) => {
+                    Some(Self{
+                        bytes: LittleEndian::read_u16(&buf[0..2]),
+                        direction,
+                    })
+                }
+                None => {
+                    None
+                }
+            }
+        }
+    }
+}
+
+// TODO Move direction out of SetSlave, make header for bulk OUT transfers instead
 #[repr(C)]
 pub struct SetSlave {
     pub slave_id: u16,
-    pub direction: Direction
 }
 
 impl SetSlave {
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() != 3 {
+        if buf.len() != 2 {
             None
         } else {
-            if let Some(direction) = Direction::n(buf[2]) {
-                Some(Self{
-                    slave_id: LittleEndian::read_u16(&buf[0..2]),
-                    direction
-                })
-            } else {
-                None
-            }
+            Some(Self{
+                slave_id: LittleEndian::read_u16(&buf[0..2]),
+            })
         }
     }
 }

@@ -10,6 +10,8 @@ edition = "2018"
 # without removing data from the structure, where heapless::spsc would seem to
 # require an intermediate buffer.
 bbqueue = {version = "0.4.12", features = ["thumbv6"]}
+# typenum just needed to go with bbqueue
+typenum = "1.13.0"
 
 cortex-m = "~0.6"
 

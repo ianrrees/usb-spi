@@ -22,6 +22,7 @@ fn main() {
         .include_item("Event")
         .include_item("ControlIn")
         .include_item("ControlOut")
+        .include_item("TransferHeader")
 
         .with_item_prefix("usb_spi_")
         .generate()
