@@ -139,7 +139,12 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 		while (read_len < data_len) {
 			actual_len = 0;
 			// TODO shorter timeout? need to loop on this, could predict time required if we knew baud
-			ret = usb_bulk_msg(usb_spi->usb_dev, usb_spi->bulk_in_pipe, xfer->tx_buf + offset + read_len, data_len - read_len, &actual_len, USB_TIMEOUT_MS);
+			dev_info(&usb_spi->usb_dev->dev, "Starting read read_len:%d data_len:%d", read_len, data_len);
+			ret = usb_bulk_msg(usb_spi->usb_dev,
+			                   usb_spi->bulk_in_pipe,
+							   xfer->rx_buf + offset + read_len, data_len - read_len,
+							   &actual_len,
+							   USB_TIMEOUT_MS);
 			if (ret == -ETIMEDOUT) {
 				// TODO sleep?
 				read_len += actual_len;
@@ -148,6 +153,7 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 				dev_err(&usb_spi->usb_dev->dev, "Error receiving bulk IN: %s (%d)", error_to_string(ret), ret);
 				goto err;
 			}
+			read_len += actual_len;
 		}
 	}
 
@@ -217,6 +223,22 @@ static int usb_spi_control_in(struct usb_spi_device *usb_spi, u8 request, u16 va
 		usb_sndctrlpipe(usb_spi->usb_dev, 0),
 		request,
 		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_IN,
+		value,
+		usb_spi->usb_interface_index,
+		buf,
+		len,
+		USB_TIMEOUT_MS
+	);
+}
+
+/// Returns number of bytes transferred, or negative error code
+static int usb_spi_control_out(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
+{
+	return usb_control_msg(
+		usb_spi->usb_dev,
+		usb_sndctrlpipe(usb_spi->usb_dev, 0),
+		request,
+		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_OUT,
 		value,
 		usb_spi->usb_interface_index,
 		buf,

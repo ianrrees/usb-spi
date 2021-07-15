@@ -158,7 +158,7 @@ impl TransferHeader {
     }
 }
 
-// TODO Move direction out of SetSlave, make header for bulk OUT transfers instead
+// TODO add a speed setting?
 #[repr(C)]
 pub struct SetSlave {
     pub slave_id: u16,

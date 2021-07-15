@@ -4,14 +4,29 @@
 #include <linux/module.h>
 #include <linux/spi/spi.h>
 
+#define BUF_SIZE 10
+
 static int test_driver_probe(struct spi_device *dev)
 {
 	int ret = 0;
+
+	u8 *buf = kmalloc(BUF_SIZE, GFP_KERNEL);
+	if (!buf) {
+		return -ENOMEM;
+	}
+	memset(buf, 0xFF, BUF_SIZE);
+
 	dev_info(&dev->dev, "Test driver probed, IRQ: %d", dev->irq);
 
-	ret = spi_write(dev, "hello!", 7);
+	// ret = spi_write(dev, "hello!", 7);
+	ret = spi_read(dev, buf, 5);
 
-	dev_info(&dev->dev, "Write done, return code %d", ret);
+	printk(KERN_INFO "Read: 0x%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+		buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]);
+
+	dev_info(&dev->dev, "Test transfer done, return code %d", ret);
+
+	kfree(buf);
 	
     return 0;
 }
