@@ -29,6 +29,10 @@ typedef uint8_t usb_spi_ControlOut;
  * change based on the SPI direction.
  */
 enum usb_spi_Direction {
+  /**
+   * Only used internally in the firmware, not for over-the-wire protocol
+   */
+  None,
   OutOnly,
   InOnly,
   Both,

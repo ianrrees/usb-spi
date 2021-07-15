@@ -121,9 +121,11 @@ pub enum ControlOut {
 /// USB is used because the protocol could be used for attaching SPI controllers
 /// or peripherals, but the logic around headers going in OUT transfer wouldn't
 /// change based on the SPI direction.
-#[derive(Copy, Clone, Debug, N)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, N)]
 #[repr(u8)]
 pub enum Direction {
+    /// Only used internally in the firmware, not for over-the-wire protocol
+    None,
     OutOnly,
     InOnly,
     Both,
