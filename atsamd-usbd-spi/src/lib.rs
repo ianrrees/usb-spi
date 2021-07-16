@@ -5,12 +5,11 @@ extern crate defmt_rtt;
 
 use atsamd_hal::{
     gpio::v2::*,
-    hal::digital::v2::OutputPin, // embedded_hal traits
+    hal::digital::v2::OutputPin, // embedded_hal trait
     prelude::*,
     sercom::v2::spi::{
-        Config, EightBit, Error as SpiError, Flags, Master, Rx, Spi, Tx, ValidPads,
+        Config, EightBit, Error as SpiError, Errors as SpiErrors, Flags, Master, Phase, Polarity, Rx, Spi, Tx, ValidPads,
     },
-    // time::Hertz,
     typelevel::NoneT,
 };
 
@@ -60,12 +59,10 @@ pub struct BasicSpiDevice<P: AnyPin<Mode = PushPullOutput>> {
 
 impl <P: AnyPin<Mode = PushPullOutput> + OutputPin> SpiDevice for BasicSpiDevice<P> {
     fn select(&mut self) {
-        defmt::info!("In BasicSpiDevice::select() for {:?}", self.modalias); // TODO
         self.cs_pin.set_low().ok().unwrap();
     }
 
     fn deselect(&mut self) {
-        defmt::info!("In BasicSpiDevice::deselect() for {:?}", self.modalias); // TODO
         self.cs_pin.set_high().ok().unwrap();
     }
 
@@ -146,6 +143,10 @@ impl TransactionState {
     }
 }
 
+// TODO add enable+disable methods and events for the attached devices.  Our driver could then
+// register/deregister the drivers for those devices, and our user could activate/deactivate
+// based on the hardware reset signal.
+//
 /// A USB CDC to SPI
 pub struct UsbSpi<'a, B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize>
 where
@@ -168,6 +169,7 @@ where
     /// SPI end of the USB->SPI buffer
     usb_to_spi_consumer: Consumer<'a, BufferSize>,
 
+    /// USB IN endpoint state
     write_state: WriteState,
 
     /// The enabled SPI hardware
@@ -194,12 +196,21 @@ where
         alloc: &'a UsbBusAllocator<B>,
         storage: &'a UsbSpiStorage,
         spi_hardware: Config<P, Master, EightBit>,
-        devices: [&'a mut dyn SpiDevice; DEVICE_COUNT],
+        mut devices: [&'a mut dyn SpiDevice; DEVICE_COUNT],
     ) -> Self {
         let (spi_to_usb_producer, spi_to_usb_consumer) = storage.rx_buffer.try_split().unwrap();
         let (usb_to_spi_producer, usb_to_spi_consumer) = storage.tx_buffer.try_split().unwrap();
 
-        let spi = spi_hardware.enable();
+        for device in &mut devices {
+            device.deselect();
+        }
+
+        let spi = spi_hardware
+            // TODO encode these in the device settings
+            .cpol(Polarity::IdleHigh)
+            .cpha(Phase::CaptureOnSecondTransition)
+            .baud(1000.khz())
+            .enable();
 
         Self {
             usb_interface: alloc.interface(),
@@ -308,73 +319,62 @@ where
     ///
     /// Can be entered in either a USB or SPI interrupt context.
     fn flush_spi(&mut self) {
-        match self.spi_state.direction {
-            Direction::OutOnly | Direction::Both => {
-                match self.usb_to_spi_consumer.read() {
-                    Ok(grant) => {
-                        // The buffer returned is guaranteed to have at least one byte
-                        match self.spi.send(grant.buf()[0]) {
-                            Ok(()) => {
-                                self.spi_state.sent += 1;
-                                // The only way to clear DRE is to write data, so only
-                                // enable it when we'll have more data to write.
-                                if grant.buf().len() > 1 {
-                                    self.spi.enable_interrupts(Flags::DRE);
-                                } else {
-                                    self.spi.disable_interrupts(Flags::DRE);
+        interrupt::free(|_| { // TODO time this... and/or implement the minimum level scheme
+            match self.spi_state.direction {
+                Direction::OutOnly | Direction::Both => {
+                    match self.usb_to_spi_consumer.read() {
+                        Ok(grant) => {
+                            // The buffer returned is guaranteed to have at least one byte
+                            match self.spi.send(grant.buf()[0]) {
+                                Ok(()) => {
+                                    self.spi_state.sent += 1;
+
+                                    grant.release(1);  
                                 }
-                                grant.release(1);  
-                            }
-                            Err(nb::Error::WouldBlock) => {
-                                // SPI isn't ready for the next byte
-                            }
-                            Err(_) => {
-                                defmt::error!("error in flush_spi() Out|Both"); // TODO
-                            }
-                        };
-                    }
-                    Err(BBError::InsufficientSize) => {
-                        // There's no more data in the buffer to write
-                        // TODO We seem to get continual DRE callbacks; is that expected?
-                    }
-                    Err(BBError::GrantInProgress) => {
-                        // We'll hit this when the USB or SPI ISR interrupts the other;
-                        // it's effectively a mutex protecting the spi send call
-                    }
-                    Err(BBError::AlreadySplit) => {
-                        unreachable!();
+                                Err(nb::Error::WouldBlock) => {
+                                    // SPI isn't ready for the next byte
+                                }
+                                Err(nb::Error::Other(SpiError::Overflow)) => {
+                                    defmt::error!("Overflow in flush_spi() Out|Both"); // TODO
+                                    self.spi.clear_errors(SpiErrors::BUFOVF);
+                                }
+                            };
+                        }
+                        Err(BBError::InsufficientSize) => {
+                            // There's no more data in the buffer to write
+                            // TODO We seem to get continual DRE callbacks; is that expected?
+                        }
+                        Err(BBError::GrantInProgress) => {
+                            // We'll hit this when the USB or SPI ISR interrupts the other;
+                            // it's effectively a mutex protecting the spi send call
+                            defmt::warn!("GrantInProgress in flush_spi()");
+                        }
+                        Err(BBError::AlreadySplit) => {
+                            unreachable!();
+                        }
                     }
                 }
-            }
-            Direction::InOnly => {
-                interrupt::free(|_| {
+                Direction::InOnly => {
                     if self.spi_state.sent < self.spi_state.expected {
                         match self.spi.send(USB_SPI_TX_FILL) {
                             Ok(()) => {
                                 self.spi_state.sent += 1;
-    
-                                // The only way to clear DRE is to write data, so only
-                                // enable it when we'll have more data to write.
-                                if self.spi_state.sent < self.spi_state.expected {
-                                    self.spi.enable_interrupts(Flags::DRE);
-                                } else {
-                                    self.spi.disable_interrupts(Flags::DRE);
-                                }
                             }
                             Err(nb::Error::WouldBlock) => {
                                 // SPI isn't ready for the next byte
                             }
-                            Err(_) => {
-                                defmt::error!("error in flush_spi() Direction::InOnly"); // TODO
+                            Err(nb::Error::Other(SpiError::Overflow)) => {
+                                defmt::error!("Overflow in flush_spi() Direction::InOnly"); // TODO
+                                self.spi.clear_errors(SpiErrors::BUFOVF);
                             }
                         };
                     }
-                });
+                }
+                Direction::None => {
+                    // defmt::info!("In flush_spi() with Direction::None");
+                }
             }
-            Direction::None => {
-                // defmt::info!("In flush_spi() with Direction::None");
-            }
-        }
+        });
     }
 
     // TODO split this in to another struct so users don't need two ISRs that both reference Self
@@ -385,6 +385,7 @@ where
                     Ok(mut grant) => {
                         match self.spi.read() {
                             Ok(c) => {
+                                defmt::info!("Read {:X}", c);
                                 grant.buf()[0] = c;
                                 grant.commit(1);
         
@@ -395,13 +396,15 @@ where
                                 // Drop the grant without committing
                             }
                             Err(nb::Error::Other(SpiError::Overflow)) => {
-                                defmt::error!("SPI Overflow"); // TODO
+                                defmt::error!("SPI Overflow in callback InOnly|Both"); // TODO
+                                self.spi.clear_errors(SpiErrors::BUFOVF);
                             }
                         }
                     }
                     Err(_) => {
                         // TODO better error reporting
                         defmt::error!("SPI->USB overflow");
+                        panic!("Bam");
                     }
                 }
             }
@@ -409,15 +412,22 @@ where
             Direction::OutOnly | Direction::None => {
                 match self.spi.read() {
                     Ok(_) => {
-                        if self.spi_state.direction == Direction::OutOnly {
-                            self.spi_state.received += 1;
-                        }
+                        self.spi_state.received += 1;
+                        // if self.spi_state.direction == Direction::None {
+                        //     defmt::info!("Dropped None {:X}", c);
+                        // } else {
+                        //     defmt::info!("Dropped OutOnly {:X}", c);
+                        // }
+                        // if self.spi_state.direction == Direction::OutOnly {
+                        //     self.spi_state.received += 1;
+                        // }
                     }
                     Err(nb::Error::WouldBlock) => {
                         // Nothing to read here
                     }
                     Err(nb::Error::Other(SpiError::Overflow)) => {
-                        defmt::error!("SPI Overflow"); // TODO
+                        defmt::error!("SPI Overflow in callback OutOnly|None"); // TODO
+                        self.spi.clear_errors(SpiErrors::BUFOVF);
                     }
                 }
             }
@@ -434,27 +444,30 @@ where
                 self.spi_state.expected == self.spi_state.received
             }
             Direction::OutOnly => {
+                defmt::info!("End of OutOnly ISR, expected:{:?} sent:{:?}", self.spi_state.expected, self.spi_state.sent);
                 self.spi_state.expected == self.spi_state.sent
             }
             Direction::None => {
                 false
             }
         } {
+            self.spi.disable_interrupts(Flags::RXC); // Not yet clear why this is necessary
             self.spi_state.direction = Direction::None;
         }
     }
 
     pub fn select(&mut self, device_index: Option<usize>) {
-        // TODO we'll want a mutex or similar to select this, due to deselect when finishing a transaction
-        if device_index != self.selected_device {
-            if let Some(index) = self.selected_device {
-                self.devices[index].deselect();
+        interrupt::free(|_| { // TODO implement the minimum level scheme instead
+            if device_index != self.selected_device {
+                if let Some(index) = self.selected_device {
+                    self.devices[index].deselect();
+                }
+                if let Some(index) = device_index {
+                    self.devices[index].select();
+                }
+                self.selected_device = device_index;
             }
-            if let Some(index) = device_index {
-                self.devices[index].select();
-            }
-            self.selected_device = device_index;
-        }
+        });
     }
 }
 
@@ -481,10 +494,46 @@ where
         // TODO
         // self.read_buf.clear();
         // self.write_buf.clear();
+        loop {
+            match self.spi_to_usb_consumer.read() {
+                Ok(grant) => {
+                    let length = grant.buf().len();
+                    grant.release(length);
+                }
+                Err(BBError::InsufficientSize) => {
+                    break;
+                }
+                _ => {
+                    // TODO better
+                    panic!("USB-SPI Unexpected result draining buffers for reset");
+                }
+            }
+        }
+        loop {
+            match self.usb_to_spi_consumer.read() {
+                Ok(grant) => {
+                    let length = grant.buf().len();
+                    grant.release(length);
+                }
+                Err(BBError::InsufficientSize) => {
+                    break;
+                }
+                _ => {
+                    // TODO better
+                    panic!("USB-SPI Unexpected result draining buffers for reset");
+                }
+            }
+        }
+
         self.write_state = WriteState::NotFull;
+        self.spi_state = TransactionState::new();
+        self.usb_state = TransactionState::new();
     }
 
     fn poll(&mut self) {
+        // TODO move the first chunk of this (and the similar bit in atsamd-usbd-uart) in to a .endpoint_out() method
+        // so that poll() doesn't get slowed down too much.
+        
         // Make sure we've got space to store new data, because once the
         // endpoint is read, the host can overwrite whatever data is in it.
         match self.usb_to_spi_producer.grant_exact(ENDPOINT_SIZE) {
@@ -499,31 +548,49 @@ where
                     }
 
                     (Direction::OutOnly, Direction::OutOnly) | (Direction::Both, Direction::Both) => {
+                        defmt::info!("continuing transaction"); // TODO
                         // More data for an ongoing transaction
                         continue_transaction = true;
                     }
 
                     (Direction::None, Direction::OutOnly) => {
                         // Waiting for an OutOnly transaction to finish
+                        defmt::warn!("Ignoring USB OUT while waiting for SPI");
                     }
 
                     _ => {
                         // TODO 
-                        defmt::error!("USB OUT transfer when in an invalid state {:?} {:?}",
-                                      self.usb_state.direction as usize, self.spi_state.direction as usize);
+                        defmt::warn!("Ignoring USB OUT transfer when in an invalid state {:?} {:?}",
+                                     self.usb_state.direction as usize, self.spi_state.direction as usize);
                     }
                 }
 
                 if start_transaction || continue_transaction {
                     let mut buf = [0u8; ENDPOINT_SIZE];
-                    match self.read_endpoint.read(&mut buf) {
+                    match self.read_endpoint.read(&mut buf) { // TODO read straight in to the bbqueue if continuing
                         Ok(count) => {
                             if start_transaction {
                                 if let Some(header) = TransferHeader::decode(&buf[..count]) {
                                     let header_len = core::mem::size_of::<TransferHeader>();
                         
                                     let direction = header.direction;
-                
+
+                                    match direction {
+                                        Direction::OutOnly =>  {
+                                            defmt::info!("starting OutOnly transaction");
+                                        }
+                                        Direction::InOnly => {
+                                            defmt::info!("starting InOnly transaction");
+                                        }
+                                        Direction::Both => {
+                                            defmt::info!("starting Both transaction");
+                                        }
+                                        Direction::None => {
+                                            defmt::error!("NOT starting None transaction");
+                                            return;
+                                        }
+                                    }
+
                                     // These differ if the SPI transfer is bigger than a USB packet
                                     let expected = header.bytes as usize;
                                     let received = count - header_len;
@@ -542,11 +609,14 @@ where
                                     self.spi_state.expected = expected;
                                     self.spi_state.received = 0;
                                     self.spi_state.sent = 0;
+
+                                    self.spi.enable_interrupts(Flags::RXC);
                                 } else {
                                     // Header failed to decode
                                     unimplemented!();
                                 }
                             } else {
+                                // Continuing an existing transaction
                                 grant.buf()[..count].copy_from_slice(&buf[..count]);
                                 grant.commit(count);
 
@@ -647,8 +717,6 @@ where
             return;
         }
 
-        defmt::info!("USB-SPI got a Control OUT request! {:?}", req.request);
-
         match protocol::ControlOut::n(req.request) {
             Some(protocol::ControlOut::SetSlave) => {
                 match protocol::SetSlave::decode(xfer.data()) {
@@ -656,6 +724,9 @@ where
                         let device_index = usize::from(setting.slave_id);
                         if device_index < self.devices.len() {
                             self.select(Some(device_index));
+                            xfer.accept().unwrap_or_else(|_| {
+                                defmt::error!("Failed to accept control OUT request")
+                            });
                         } else {
                             defmt::info!("USB-SPI rejecting out-of-range SetSlave request");
                             xfer.reject().unwrap_or_else(|_| {

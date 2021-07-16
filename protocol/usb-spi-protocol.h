@@ -79,6 +79,10 @@ typedef struct usb_spi_Event {
   usb_spi_EventType event;
 } usb_spi_Event;
 
+typedef struct usb_spi_SetSlave {
+  uint16_t slave_id;
+} usb_spi_SetSlave;
+
 /**
  * Sent through the bulk OUT endpoint, possibly before any OUT data
  */

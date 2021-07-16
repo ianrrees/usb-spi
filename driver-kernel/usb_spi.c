@@ -28,11 +28,13 @@ struct usb_spi_device {
 	struct mutex usb_mutex;
 	u16 usb_interface_index;
 	u16 connected_count;
+	/// -1 initially, then the index of the selected device
+	int selected_chip;
 	unsigned int bulk_out_pipe;
 	unsigned int bulk_in_pipe;
 	unsigned hardware_buf_size;
 	unsigned usb_buf_sz;
-	u8 *usb_buffer; // Protected by usb_mutex
+	void *usb_buffer; // Protected by usb_mutex
 };
 
 // TODO this is bound to exist somewhere else...
@@ -63,6 +65,38 @@ static const char * error_to_string(int err)
 		case -ETIMEDOUT:    return "ETIMEDOUT";
 		default:            return "???";
 	}
+}
+
+/// Returns number of bytes transferred, or negative error code
+static int usb_spi_control_in(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
+{
+	return usb_control_msg(
+		usb_spi->usb_dev,
+		usb_rcvctrlpipe(usb_spi->usb_dev, 0),
+		request,
+		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_IN,
+		value,
+		usb_spi->usb_interface_index,
+		buf,
+		len,
+		USB_TIMEOUT_MS
+	);
+}
+
+/// Returns number of bytes transferred, or negative error code
+static int usb_spi_control_out(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
+{
+	return usb_control_msg(
+		usb_spi->usb_dev,
+		usb_sndctrlpipe(usb_spi->usb_dev, 0),
+		request,
+		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_OUT,
+		value,
+		usb_spi->usb_interface_index,
+		buf,
+		len,
+		USB_TIMEOUT_MS
+	);
 }
 
 // Called after spi_new_device(), not when a driver attaches
@@ -109,6 +143,10 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 
 		memcpy(usb_spi->usb_buffer + sizeof(*header), xfer->tx_buf + offset, data_len);
 
+		if (data_len == 1) { // TODO
+			dev_warn(&usb_spi->usb_dev->dev, "sending 0x%02X", ((char *)usb_spi->usb_buffer)[sizeof(*header)]);
+		}
+
 	} else if (xfer->rx_buf) {
 		data_len = min(data_len, usb_spi->usb_buf_sz);
 		data_len = min(data_len, usb_spi->hardware_buf_size);
@@ -122,6 +160,7 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 		goto err;
 	}
 
+	// TODO retry - can happen when SPI data is enqueued for instance
 	ret = usb_bulk_msg(usb_spi->usb_dev, usb_spi->bulk_out_pipe, usb_spi->usb_buffer, out_len, &actual_len, USB_TIMEOUT_MS);
 
 	if (ret < 0) {
@@ -142,22 +181,53 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 			dev_info(&usb_spi->usb_dev->dev, "Starting read read_len:%d data_len:%d", read_len, data_len);
 			ret = usb_bulk_msg(usb_spi->usb_dev,
 			                   usb_spi->bulk_in_pipe,
-							   xfer->rx_buf + offset + read_len, data_len - read_len,
+							   usb_spi->usb_buffer,
+							   data_len - read_len,
 							   &actual_len,
 							   USB_TIMEOUT_MS);
-			if (ret == -ETIMEDOUT) {
-				// TODO sleep?
-				read_len += actual_len;
-				continue;
-			} else if (ret < 0) {
+			memcpy(xfer->rx_buf + offset + read_len, usb_spi->usb_buffer, actual_len);
+			read_len += actual_len;
+			if (ret < 0 && ret != -ETIMEDOUT) {
 				dev_err(&usb_spi->usb_dev->dev, "Error receiving bulk IN: %s (%d)", error_to_string(ret), ret);
 				goto err;
 			}
-			read_len += actual_len;
+			if (actual_len > 0) {
+				dev_warn(&usb_spi->usb_dev->dev, "Received %dB 0x%02X", actual_len, ((char *)usb_spi->usb_buffer)[0]); // TODO
+			}
 		}
 	}
 
 	return data_len;
+err:
+	return ret;
+}
+
+/// Returns negative error code, or chip select index on success
+static int usb_spi_setup_transfer(struct usb_spi_device *usb_spi, int cs)
+{
+	int ret = -EINVAL;
+
+	// caller has locked usb_mutex already
+	struct usb_spi_SetSlave *set_slave_cmd = usb_spi->usb_buffer;
+
+	if (cs < 0 || cs > usb_spi->connected_count) {
+		dev_err(&usb_spi->usb_dev->dev,
+		        "Chip select %d is out of range [0, %d)", cs, usb_spi->connected_count);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	memset(set_slave_cmd, 0, sizeof(*set_slave_cmd));
+	set_slave_cmd->slave_id = (u16)cs;
+
+	// Could move slave_id in to the value field of the request...
+	ret = usb_spi_control_out(usb_spi, SetSlave, 0, set_slave_cmd, sizeof(*set_slave_cmd));
+	if (ret < 0) {
+		dev_err(&usb_spi->usb_dev->dev, "Control OUT SetSlave failed %d: %s", ret, error_to_string(ret));
+		goto err;
+	}
+	ret = cs;
+
 err:
 	return ret;
 }
@@ -174,6 +244,17 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 	mutex_lock(&usb_spi->usb_mutex);
 	list_for_each_entry(xfer, &mesg->transfers, transfer_list) {
 		int transferred = 0;
+
+		if (usb_spi->selected_chip != mesg->spi->chip_select) {
+			// TODO select the speed, etc (if it isn't already?)
+			usb_spi->selected_chip = usb_spi_setup_transfer(usb_spi, mesg->spi->chip_select);
+			if (usb_spi->selected_chip < 0) {
+				ret = usb_spi->selected_chip;
+				usb_spi->selected_chip = -1; // May as well be consistent
+				goto err;
+			}
+		}
+
 		dev_info(&usb_spi->usb_dev->dev, "SPI transfer: %s%s, %dB, Speed:%d",
 		         xfer->tx_buf?"Tx":"", xfer->rx_buf?"Rx":"", xfer->len, xfer->speed_hz);
 		if (xfer->bits_per_word != 8) {
@@ -182,7 +263,7 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 					 xfer->bits_per_word);
 		}
 
-		// TODO select the slave, speed, etc (if it isn't already?)
+	// TODO check SPI mode
 
 		while (transferred < xfer->len) {
 			ret = usb_spi_transfer_chunk(usb_spi, xfer, transferred);
@@ -208,53 +289,22 @@ static struct spi_board_info spi_board_info[] = {
         .modalias       = "spi-test",
         // .platform_data  = &ads_info,
         .mode           = SPI_MODE_0,
-        .irq            = 1234,
+        // .irq            = 1234,
         .max_speed_hz   = 120000 /* max sample rate at 3V */ * 16,
         .bus_num        = 1,
         .chip_select    = 0,
 },
 };
 
-/// Returns number of bytes transferred, or negative error code
-static int usb_spi_control_in(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
-{
-	return usb_control_msg(
-		usb_spi->usb_dev,
-		usb_sndctrlpipe(usb_spi->usb_dev, 0),
-		request,
-		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_IN,
-		value,
-		usb_spi->usb_interface_index,
-		buf,
-		len,
-		USB_TIMEOUT_MS
-	);
-}
-
-/// Returns number of bytes transferred, or negative error code
-static int usb_spi_control_out(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
-{
-	return usb_control_msg(
-		usb_spi->usb_dev,
-		usb_sndctrlpipe(usb_spi->usb_dev, 0),
-		request,
-		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_OUT,
-		value,
-		usb_spi->usb_interface_index,
-		buf,
-		len,
-		USB_TIMEOUT_MS
-	);
-}
-
 /// Returns 0 on success, or negative error code
 static int usb_spi_get_master_info(struct usb_spi_device *usb_spi)
 {
 	int ret = 0;
-	const struct usb_spi_MasterInfo *info = NULL;
 
+	struct usb_spi_MasterInfo *info = usb_spi->usb_buffer;
 	mutex_lock(&usb_spi->usb_mutex);
-	ret = usb_spi_control_in(usb_spi, REQUEST_IN_HW_INFO, 0, usb_spi->usb_buffer, sizeof(*info));
+
+	ret = usb_spi_control_in(usb_spi, REQUEST_IN_HW_INFO, 0, info, sizeof(*info));
 	if (ret < 0) {
 		dev_err(&usb_spi->usb_dev->dev, "Control IN REQUEST_IN_HW_INFO failed %d: %s", ret, error_to_string(ret));
 		goto err;
@@ -266,14 +316,13 @@ static int usb_spi_get_master_info(struct usb_spi_device *usb_spi)
 		ret = 0;
 	}
 
-	info = (const struct usb_spi_MasterInfo *) usb_spi->usb_buffer;
-
 	if (info->hardware != SpiMaster) {
 		dev_err(&usb_spi->usb_dev->dev, "Device isn't an SPI master, unsupported");
 		ret = -EINVAL;
 		goto err;
 	}
 
+	usb_spi->selected_chip = -1;
 	usb_spi->connected_count = info->slave_count;
 	usb_spi->hardware_buf_size = info->in_buf_size;
 
@@ -378,10 +427,11 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		// determine if they provide IRQs, so we don't know how many IRQs to
 		// allocate.  Add an irq_count field, then fetch each?
 
-		const struct usb_spi_ConnectedSlaveInfoLinux *slave_info = NULL;
 		// TODO this pattern needs to check the size of the usb_buffer
+		struct usb_spi_ConnectedSlaveInfoLinux *slave_info = usb_spi->usb_buffer;
 		mutex_lock(&usb_spi->usb_mutex);
-		ret = usb_spi_control_in(usb_spi, REQUEST_IN_LINUX_SLAVE_INFO, i, usb_spi->usb_buffer, sizeof(*slave_info));
+
+		ret = usb_spi_control_in(usb_spi, REQUEST_IN_LINUX_SLAVE_INFO, i, slave_info, sizeof(*slave_info));
 		if (ret < 0) {
 			dev_err(&usb_spi->usb_dev->dev, "Control IN REQUEST_IN_LINUX_SLAVE_INFO failed %d: %s", ret, error_to_string(ret));
 			mutex_unlock(&usb_spi->usb_mutex);
@@ -393,8 +443,6 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		} else {
 			ret = 0;
 		}
-
-		slave_info = (const struct usb_spi_ConnectedSlaveInfoLinux *) usb_spi->usb_buffer;
 
 		if (slave_info->has_interrupt) {
 			dev_info(&usb_spi->usb_dev->dev, "\t\"%s\", has interrupt", slave_info->modalias);

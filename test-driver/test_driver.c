@@ -18,13 +18,32 @@ static int test_driver_probe(struct spi_device *dev)
 
 	dev_info(&dev->dev, "Test driver probed, IRQ: %d", dev->irq);
 
-	// ret = spi_write(dev, "hello!", 7);
-	ret = spi_read(dev, buf, 5);
+	if (ret >= 0) {
+		ret = spi_write(dev, "\xA0", 1);
+	}
+	if (ret >= 0) {
+		ret = spi_write(dev, "\x01", 1);
+	}
+	if (ret >= 0) {
+		ret = spi_write(dev, "\x03", 1);
+	}
+	if (ret >= 0) {
+		ret = spi_write(dev, "\x60", 1);
+	}
+	if (ret >= 0) {
+		ret = spi_write(dev, "\x03", 1);
+	}
 
-	printk(KERN_INFO "Read: 0x%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
-		buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]);
+	// ret = spi_write(dev, "\xA0\x01\x03\x60\x03", 5);
 
-	dev_info(&dev->dev, "Test transfer done, return code %d", ret);
+	if (ret >= 0) {
+		ret = spi_read(dev, buf, 5);
+
+		printk(KERN_INFO "Read: 0x%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+			buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]);
+	}
+
+	dev_info(&dev->dev, "Test transfers done, return code %d", ret);
 
 	kfree(buf);
 	
