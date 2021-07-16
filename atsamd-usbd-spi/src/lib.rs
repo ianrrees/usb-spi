@@ -530,124 +530,124 @@ where
         self.usb_state = TransactionState::new();
     }
 
-    fn poll(&mut self) {
-        // TODO move the first chunk of this (and the similar bit in atsamd-usbd-uart) in to a .endpoint_out() method
-        // so that poll() doesn't get slowed down too much.
-        
+    fn endpoint_out(&mut self, addr: EndpointAddress) {
+        if addr != self.read_endpoint.address() {
+            return;
+        }
+
         // Make sure we've got space to store new data, because once the
         // endpoint is read, the host can overwrite whatever data is in it.
-        match self.usb_to_spi_producer.grant_exact(ENDPOINT_SIZE) {
-            Ok(mut grant) => {
-                let mut start_transaction = false;
-                let mut continue_transaction = false;
-                
-                match (self.usb_state.direction, self.spi_state.direction) {
-                    (Direction::None, Direction::None) => {
-                        // Normal start to a transaction, should receive a header
-                        start_transaction = true;
-                    }
-
-                    (Direction::OutOnly, Direction::OutOnly) | (Direction::Both, Direction::Both) => {
-                        defmt::info!("continuing transaction"); // TODO
-                        // More data for an ongoing transaction
-                        continue_transaction = true;
-                    }
-
-                    (Direction::None, Direction::OutOnly) => {
-                        // Waiting for an OutOnly transaction to finish
-                        defmt::warn!("Ignoring USB OUT while waiting for SPI");
-                    }
-
-                    _ => {
-                        // TODO 
-                        defmt::warn!("Ignoring USB OUT transfer when in an invalid state {:?} {:?}",
-                                     self.usb_state.direction as usize, self.spi_state.direction as usize);
-                    }
+        if let Ok(mut grant) =  self.usb_to_spi_producer.grant_exact(ENDPOINT_SIZE) {
+            let mut start_transaction = false;
+            let mut continue_transaction = false;
+            
+            match (self.usb_state.direction, self.spi_state.direction) {
+                (Direction::None, Direction::None) => {
+                    // Normal start to a transaction, should receive a header
+                    start_transaction = true;
                 }
 
-                if start_transaction || continue_transaction {
-                    let mut buf = [0u8; ENDPOINT_SIZE];
-                    match self.read_endpoint.read(&mut buf) { // TODO read straight in to the bbqueue if continuing
-                        Ok(count) => {
-                            if start_transaction {
-                                if let Some(header) = TransferHeader::decode(&buf[..count]) {
-                                    let header_len = core::mem::size_of::<TransferHeader>();
-                        
-                                    let direction = header.direction;
+                (Direction::OutOnly, Direction::OutOnly) | (Direction::Both, Direction::Both) => {
+                    defmt::info!("continuing transaction"); // TODO
+                    // More data for an ongoing transaction
+                    continue_transaction = true;
+                }
 
-                                    match direction {
-                                        Direction::OutOnly =>  {
-                                            defmt::info!("starting OutOnly transaction");
-                                        }
-                                        Direction::InOnly => {
-                                            defmt::info!("starting InOnly transaction");
-                                        }
-                                        Direction::Both => {
-                                            defmt::info!("starting Both transaction");
-                                        }
-                                        Direction::None => {
-                                            defmt::error!("NOT starting None transaction");
-                                            return;
-                                        }
-                                    }
+                (Direction::None, Direction::OutOnly) => {
+                    // Waiting for an OutOnly transaction to finish
+                    defmt::warn!("Ignoring USB OUT while waiting for SPI");
+                }
 
-                                    // These differ if the SPI transfer is bigger than a USB packet
-                                    let expected = header.bytes as usize;
-                                    let received = count - header_len;
-                
-                                    if direction == Direction::OutOnly || direction == Direction::Both {
-                                        grant.buf()[0..received].copy_from_slice(&buf[header_len..count]);
-                                        grant.commit(received);
-                                    }
-                
-                                    self.usb_state.direction = direction;
-                                    self.usb_state.expected = expected;
-                                    self.usb_state.received = received;
-                                    self.usb_state.sent = 0;
-                
-                                    self.spi_state.direction = direction;
-                                    self.spi_state.expected = expected;
-                                    self.spi_state.received = 0;
-                                    self.spi_state.sent = 0;
-
-                                    self.spi.enable_interrupts(Flags::RXC);
-                                } else {
-                                    // Header failed to decode
-                                    unimplemented!();
-                                }
-                            } else {
-                                // Continuing an existing transaction
-                                grant.buf()[..count].copy_from_slice(&buf[..count]);
-                                grant.commit(count);
-
-                                self.usb_state.received += count;
-                            }
-
-                            if self.usb_state.direction == Direction::OutOnly
-                               && self.usb_state.expected == self.usb_state.received {
-                                self.usb_state.direction = Direction::None;
-                            }
-            
-                            self.flush_spi(); // NOP if the SPI is already busy
-                        }
-                        Err(UsbError::WouldBlock) => {
-                            // No data to read, just drop the grant
-                        }
-                        Err(_) => {
-                            // TODO handle this better
-                            defmt::error!("Error reading OUT data");
-                        }
-                    }
+                _ => {
+                    // TODO 
+                    defmt::warn!("Ignoring USB OUT transfer when in an invalid state {:?} {:?}",
+                                    self.usb_state.direction as usize, self.spi_state.direction as usize);
                 }
             }
-            Err(_) => {
+
+            if start_transaction || continue_transaction {
+                let mut buf = [0u8; ENDPOINT_SIZE];
+                match self.read_endpoint.read(&mut buf) { // TODO read straight in to the bbqueue if continuing
+                    Ok(count) => {
+                        if start_transaction {
+                            if let Some(header) = TransferHeader::decode(&buf[..count]) {
+                                let header_len = core::mem::size_of::<TransferHeader>();
+                    
+                                let direction = header.direction;
+
+                                match direction {
+                                    Direction::OutOnly =>  {
+                                        defmt::info!("starting OutOnly transaction");
+                                    }
+                                    Direction::InOnly => {
+                                        defmt::info!("starting InOnly transaction");
+                                    }
+                                    Direction::Both => {
+                                        defmt::info!("starting Both transaction");
+                                    }
+                                    Direction::None => {
+                                        defmt::error!("NOT starting None transaction");
+                                        return;
+                                    }
+                                }
+
+                                // These differ if the SPI transfer is bigger than a USB packet
+                                let expected = header.bytes as usize;
+                                let received = count - header_len;
+            
+                                if direction == Direction::OutOnly || direction == Direction::Both {
+                                    grant.buf()[0..received].copy_from_slice(&buf[header_len..count]);
+                                    grant.commit(received);
+                                }
+            
+                                self.usb_state.direction = direction;
+                                self.usb_state.expected = expected;
+                                self.usb_state.received = received;
+                                self.usb_state.sent = 0;
+            
+                                self.spi_state.direction = direction;
+                                self.spi_state.expected = expected;
+                                self.spi_state.received = 0;
+                                self.spi_state.sent = 0;
+
+                                self.spi.enable_interrupts(Flags::RXC);
+                            } else {
+                                // Header failed to decode
+                                unimplemented!();
+                            }
+                        } else {
+                            // Continuing an existing transaction
+                            grant.buf()[..count].copy_from_slice(&buf[..count]);
+                            grant.commit(count);
+
+                            self.usb_state.received += count;
+                        }
+
+                        if self.usb_state.direction == Direction::OutOnly
+                            && self.usb_state.expected == self.usb_state.received {
+                            self.usb_state.direction = Direction::None;
+                        }
+        
+                        self.flush_spi(); // NOP if the SPI is already busy
+                    }
+                    Err(UsbError::WouldBlock) => {
+                        // No data to read, just drop the grant
+                    }
+                    Err(_) => {
+                        // TODO handle this better
+                        defmt::error!("Error reading OUT data");
+                    }
+                }
+            } else {
                 // Since we don't have anywhere to put more data, we can't read
                 // data out of the USB endpoint.
 
                 self.flush_spi(); // Ensure we continue draining the buffer
             }
         }
+    }
 
+    fn poll(&mut self) {
         self.flush_usb();
     }
 
@@ -660,7 +660,6 @@ where
 
     fn control_in(&mut self, xfer: ControlIn<B>) {
         let req = xfer.request();
-
         
         if !(req.request_type == control::RequestType::Vendor
              && req.recipient == control::Recipient::Interface
