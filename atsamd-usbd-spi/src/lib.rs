@@ -103,6 +103,8 @@ impl UsbSpiStorage {
 const SHORT_PACKET_INTERVAL: usize = 10;
 
 // TODO rename here and in atsamd-usbd-uart
+// TODO add back the idle state, transition to it in ep_in_complete() when
+// appropriate, and maybe make flush_usb() conditional on it
 /// Keeps track of the type of the last written packet.
 enum WriteState {
     /// The last packet written wasn't a full packet
@@ -370,6 +372,9 @@ where
                         };
                     }
                 }
+                Direction::CsAssert | Direction::CsDeassert => {
+                    defmt::warn!("USB-SPI had spi_state set to strange value");
+                }
                 Direction::None => {
                     // defmt::info!("In flush_spi() with Direction::None");
                 }
@@ -431,6 +436,10 @@ where
                     }
                 }
             }
+
+            Direction::CsAssert | Direction::CsDeassert => {
+                defmt::warn!("USB-SPI had spi_state set to strange value");
+            }
         }
 
         self.flush_spi();
@@ -447,7 +456,7 @@ where
                 defmt::info!("End of OutOnly ISR, expected:{:?} sent:{:?}", self.spi_state.expected, self.spi_state.sent);
                 self.spi_state.expected == self.spi_state.sent
             }
-            Direction::None => {
+            _ => {
                 false
             }
         } {
@@ -575,20 +584,36 @@ where
                     
                                 let direction = header.direction;
 
-                                match direction {
-                                    Direction::OutOnly =>  {
-                                        defmt::info!("starting OutOnly transaction");
+                                // match direction {
+                                //     Direction::OutOnly =>  {
+                                //         defmt::info!("starting OutOnly transaction");
+                                //     }
+                                //     Direction::InOnly => {
+                                //         defmt::info!("starting InOnly transaction");
+                                //     }
+                                //     Direction::Both => {
+                                //         defmt::info!("starting Both transaction");
+                                //     }
+                                //     Direction::None => {
+                                //         defmt::error!("No transaction!?");
+                                //         // TODO
+                                //     }
+                                // }
+
+                                if direction == Direction::CsDeassert {
+                                    self.select(None);
+                                    return;
+                                }
+
+                                if direction == Direction::CsAssert {
+                                    let slave_index = usize::from(header.bytes);
+                                    if slave_index < self.devices.len() {
+                                        self.select(Some(slave_index));
+                                    } else {
+                                        // TODO log error
+                                        defmt::error!("Got an invalid slave ID");
                                     }
-                                    Direction::InOnly => {
-                                        defmt::info!("starting InOnly transaction");
-                                    }
-                                    Direction::Both => {
-                                        defmt::info!("starting Both transaction");
-                                    }
-                                    Direction::None => {
-                                        defmt::error!("NOT starting None transaction");
-                                        return;
-                                    }
+                                    return;
                                 }
 
                                 // These differ if the SPI transfer is bigger than a USB packet
@@ -716,37 +741,13 @@ where
             return;
         }
 
-        match protocol::ControlOut::n(req.request) {
-            Some(protocol::ControlOut::SetSlave) => {
-                match protocol::SetSlave::decode(xfer.data()) {
-                    Some(setting) => {
-                        let device_index = usize::from(setting.slave_id);
-                        if device_index < self.devices.len() {
-                            self.select(Some(device_index));
-                            xfer.accept().unwrap_or_else(|_| {
-                                defmt::error!("Failed to accept control OUT request")
-                            });
-                        } else {
-                            defmt::info!("USB-SPI rejecting out-of-range SetSlave request");
-                            xfer.reject().unwrap_or_else(|_| {
-                                defmt::error!("USB-SPI Failed to reject control OUT request")
-                            });
-                        }
-                    }
-                    None => {
-                        defmt::warn!("USB-SPI rejecting corrupt SetSlave request");
-                        xfer.reject().unwrap_or_else(|_| {
-                            defmt::error!("USB-SPI Failed to reject control OUT request")
-                        });
-                    }
-                }
-            }
-            None => {
-                defmt::warn!("USB-SPI rejecting unknown control_out request {:?}", req.request);
-                xfer.reject().unwrap_or_else(|_| {
-                    defmt::error!("USB-SPI Failed to reject control OUT request")
-                });
-            }
-        }
+        // match protocol::ControlOut::n(req.request) {
+        //     None => {
+        //         defmt::warn!("USB-SPI rejecting unknown control_out request {:?}", req.request);
+        //         xfer.reject().unwrap_or_else(|_| {
+        //             defmt::error!("USB-SPI Failed to reject control OUT request")
+        //         });
+        //     }
+        // }
     }
 }

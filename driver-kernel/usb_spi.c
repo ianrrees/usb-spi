@@ -83,21 +83,21 @@ static int usb_spi_control_in(struct usb_spi_device *usb_spi, u8 request, u16 va
 	);
 }
 
-/// Returns number of bytes transferred, or negative error code
-static int usb_spi_control_out(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
-{
-	return usb_control_msg(
-		usb_spi->usb_dev,
-		usb_sndctrlpipe(usb_spi->usb_dev, 0),
-		request,
-		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_OUT,
-		value,
-		usb_spi->usb_interface_index,
-		buf,
-		len,
-		USB_TIMEOUT_MS
-	);
-}
+// /// Returns number of bytes transferred, or negative error code
+// static int usb_spi_control_out(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
+// {
+// 	return usb_control_msg(
+// 		usb_spi->usb_dev,
+// 		usb_sndctrlpipe(usb_spi->usb_dev, 0),
+// 		request,
+// 		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_OUT,
+// 		value,
+// 		usb_spi->usb_interface_index,
+// 		buf,
+// 		len,
+// 		USB_TIMEOUT_MS
+// 	);
+// }
 
 // Called after spi_new_device(), not when a driver attaches
 static int usb_spi_setup(struct spi_device *spi)
@@ -160,17 +160,21 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 		goto err;
 	}
 
-	// TODO retry - can happen when SPI data is enqueued for instance
-	ret = usb_bulk_msg(usb_spi->usb_dev, usb_spi->bulk_out_pipe, usb_spi->usb_buffer, out_len, &actual_len, USB_TIMEOUT_MS);
-
-	if (ret < 0) {
-		dev_err(&usb_spi->usb_dev->dev, "Error sending bulk OUT: %s (%d)", error_to_string(ret), ret);
-		goto err;
-	}
-	if (out_len != actual_len) {
-		dev_err(&usb_spi->usb_dev->dev, "Bulk OUT length %d not expected %d", actual_len, out_len);
-		ret = -EPIPE;
-		goto err;
+	{ // TODO make a bulk transfer fn that handles retries automatically
+		unsigned wrote_len = 0;
+		while (wrote_len < out_len) {
+			ret = usb_bulk_msg(usb_spi->usb_dev,
+			                   usb_spi->bulk_out_pipe,
+			                   usb_spi->usb_buffer,
+			                   out_len,
+			                   &actual_len,
+			                   USB_TIMEOUT_MS);
+			if (ret < 0 && ret != -ETIMEDOUT) {
+				dev_err(&usb_spi->usb_dev->dev, "Error sending bulk OUT: %s (%d)", error_to_string(ret), ret);
+				goto err;
+			}
+			wrote_len += actual_len;
+		}
 	}
 
 	if (xfer->rx_buf) {
@@ -202,31 +206,44 @@ err:
 	return ret;
 }
 
-/// Returns negative error code, or chip select index on success
-static int usb_spi_setup_transfer(struct usb_spi_device *usb_spi, int cs)
-{
-	int ret = -EINVAL;
+// Chip select -1 deasserts the CS, nonnegative asserts
+static int usb_spi_chip_select(struct usb_spi_device *usb_spi, int chip_select) {
+	int ret = 0;
+	int actual_len = 0;
+	int total_len = 0;
 
-	// caller has locked usb_mutex already
-	struct usb_spi_SetSlave *set_slave_cmd = usb_spi->usb_buffer;
+	// Caller has locked usb_mutex
+	struct usb_spi_TransferHeader *header = (struct usb_spi_TransferHeader *) usb_spi->usb_buffer;
+	memset(header, 0, sizeof(*header));
 
-	if (cs < 0 || cs > usb_spi->connected_count) {
+	if (chip_select < 0) {
+		header->direction = CsDeassert;
+
+	} else if (chip_select >= usb_spi->connected_count) {
 		dev_err(&usb_spi->usb_dev->dev,
-		        "Chip select %d is out of range [0, %d)", cs, usb_spi->connected_count);
+		        "Chip select %d is out of range [0, %d)",
+		        chip_select, usb_spi->connected_count);
 		ret = -EINVAL;
 		goto err;
+
+	} else {
+		header->direction = CsAssert;
+		header->bytes = chip_select;
 	}
 
-	memset(set_slave_cmd, 0, sizeof(*set_slave_cmd));
-	set_slave_cmd->slave_id = (u16)cs;
-
-	// Could move slave_id in to the value field of the request...
-	ret = usb_spi_control_out(usb_spi, SetSlave, 0, set_slave_cmd, sizeof(*set_slave_cmd));
-	if (ret < 0) {
-		dev_err(&usb_spi->usb_dev->dev, "Control OUT SetSlave failed %d: %s", ret, error_to_string(ret));
-		goto err;
+	while (total_len < sizeof(*header)) {
+		ret = usb_bulk_msg(usb_spi->usb_dev,
+		                   usb_spi->bulk_out_pipe,
+		                   usb_spi->usb_buffer,
+		                   sizeof(*header),
+		                   &actual_len,
+		                   USB_TIMEOUT_MS);
+		total_len += actual_len;
+		if (ret < 0 && ret != -ETIMEDOUT) {
+			dev_err(&usb_spi->usb_dev->dev, "Error sending bulk OUT: %s (%d)", error_to_string(ret), ret);
+			goto err;
+		}
 	}
-	ret = cs;
 
 err:
 	return ret;
@@ -242,18 +259,14 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 	         mesg->spi->chip_select); // TODO
 
 	mutex_lock(&usb_spi->usb_mutex);
+
+	ret = usb_spi_chip_select(usb_spi, mesg->spi->chip_select);
+	if (ret < 0) {
+		goto err;
+	}
+
 	list_for_each_entry(xfer, &mesg->transfers, transfer_list) {
 		int transferred = 0;
-
-		if (usb_spi->selected_chip != mesg->spi->chip_select) {
-			// TODO select the speed, etc (if it isn't already?)
-			usb_spi->selected_chip = usb_spi_setup_transfer(usb_spi, mesg->spi->chip_select);
-			if (usb_spi->selected_chip < 0) {
-				ret = usb_spi->selected_chip;
-				usb_spi->selected_chip = -1; // May as well be consistent
-				goto err;
-			}
-		}
 
 		dev_info(&usb_spi->usb_dev->dev, "SPI transfer: %s%s, %dB, Speed:%d",
 		         xfer->tx_buf?"Tx":"", xfer->rx_buf?"Rx":"", xfer->len, xfer->speed_hz);
@@ -276,6 +289,8 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 			ret = 0;
 		}
 	}
+
+	ret = usb_spi_chip_select(usb_spi, -1);
 
 err:
 	mutex_unlock(&usb_spi->usb_mutex);

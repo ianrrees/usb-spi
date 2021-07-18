@@ -109,12 +109,11 @@ pub enum ControlIn {
     REQUEST_IN_LINUX_SLAVE_INFO,
 }
 
-/// Used as the request field of OUT control transfers
-#[derive(Copy, Clone, Debug, N)]
-#[repr(u8)]
-pub enum ControlOut {
-    SetSlave,
-}
+// /// Used as the request field of OUT control transfers
+// #[derive(Copy, Clone, Debug, N)]
+// #[repr(u8)]
+// pub enum ControlOut {
+// }
 
 /// USB convention of the directions used in this transfer
 ///
@@ -123,18 +122,21 @@ pub enum ControlOut {
 /// change based on the SPI direction.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, N)]
 #[repr(u8)]
-pub enum Direction {
-    /// Only used internally in the firmware, not for over-the-wire protocol
+pub enum Direction { // TODO rename
     None,
     OutOnly,
     InOnly,
     Both,
+    /// bytes field is chip select index
+    CsAssert,
+    /// bytes field is ignored
+    CsDeassert,
 }
 
 /// Sent through the bulk OUT endpoint, possibly before any OUT data
 #[repr(C)]
 pub struct TransferHeader {
-    pub bytes: u16,
+    pub bytes: u16, // TODO rename 'data'
     pub direction: Direction,
 }
 
@@ -154,24 +156,6 @@ impl TransferHeader {
                     None
                 }
             }
-        }
-    }
-}
-
-// TODO add a speed setting?
-#[repr(C)]
-pub struct SetSlave {
-    pub slave_id: u16,
-}
-
-impl SetSlave {
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() != 2 {
-            None
-        } else {
-            Some(Self{
-                slave_id: LittleEndian::read_u16(&buf[0..2]),
-            })
         }
     }
 }

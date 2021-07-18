@@ -14,14 +14,6 @@ enum usb_spi_ControlIn {
 typedef uint8_t usb_spi_ControlIn;
 
 /**
- * Used as the request field of OUT control transfers
- */
-enum usb_spi_ControlOut {
-  SetSlave,
-};
-typedef uint8_t usb_spi_ControlOut;
-
-/**
  * USB convention of the directions used in this transfer
  *
  * USB is used because the protocol could be used for attaching SPI controllers
@@ -29,13 +21,18 @@ typedef uint8_t usb_spi_ControlOut;
  * change based on the SPI direction.
  */
 enum usb_spi_Direction {
-  /**
-   * Only used internally in the firmware, not for over-the-wire protocol
-   */
   None,
   OutOnly,
   InOnly,
   Both,
+  /**
+   * bytes field is chip select index
+   */
+  CsAssert,
+  /**
+   * bytes field is ignored
+   */
+  CsDeassert,
 };
 typedef uint8_t usb_spi_Direction;
 
@@ -78,10 +75,6 @@ typedef struct usb_spi_ConnectedSlaveInfoLinux {
 typedef struct usb_spi_Event {
   usb_spi_EventType event;
 } usb_spi_Event;
-
-typedef struct usb_spi_SetSlave {
-  uint16_t slave_id;
-} usb_spi_SetSlave;
 
 /**
  * Sent through the bulk OUT endpoint, possibly before any OUT data
