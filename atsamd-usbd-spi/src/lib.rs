@@ -18,7 +18,7 @@ pub use bbqueue::consts::*;
 use typenum::marker_traits::Unsigned; // Also get rid of this dependency
 
 // See note in Cargo.toml as to why this not heapless
-use bbqueue::{BBBuffer, Consumer, Error as BBError, Producer};
+use bbqueue::{BBBuffer, Consumer, Error as BBError, GrantR, GrantW, Producer};
 use cortex_m::interrupt;
 use usb_device::{class_prelude::*, Result};
 use usb_spi_protocol as protocol;
@@ -73,6 +73,7 @@ impl <P: AnyPin<Mode = PushPullOutput> + OutputPin> SpiDevice for BasicSpiDevice
 
 pub type SpiDeviceList<'a> = [&'a mut dyn SpiDevice];
 
+// This needs to be at least as big as the USB bulk endpoint size
 type BufferSize = U256;
 
 /// TX and RX buffers used by the UsbSpi
@@ -122,15 +123,15 @@ enum WriteState {
 ///
 /// This is necessary because SPI transactions on full duplex hardware always
 /// involve both reading and writing data, but the host might only want to read
-/// or write independently and there would be no point in buffering read in data
-/// if the host isn't interested in it, nor buffering data to write which would
-/// (hopefully!) be ignored by the peripheral.  We also might make longer SPI
-/// transactions than will fit in a single USB transaction.
+/// or write independently.  We also might make longer SPI transactions than
+/// will fit in a single USB transaction.
 struct TransactionState {
     direction: Direction,
     expected: usize,
-    received: usize,
-    sent: usize,
+    /// Count of words loaded in to the USB (OUT) -> SPI (MOSI) buffer
+    from_usb: usize,
+    /// Count of words from the SPI that have been handled in a USB context
+    from_spi: usize,
 }
 
 /// TODO could turn this in to one of those fancy typestatemachines...
@@ -139,9 +140,13 @@ impl TransactionState {
         Self {
             direction: Direction::None,
             expected: 0,
-            received: 0,
-            sent: 0,
+            from_usb: 0,
+            from_spi: 0,
         }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
     }
 }
 
@@ -177,11 +182,8 @@ where
     /// The enabled SPI hardware
     spi: Spi<Config<P, Master, EightBit>>,
 
-    /// Only modified in the USB ISR
-    usb_state: TransactionState,
-
-    /// Only modified in the SPI ISR, except transition out of Idle in the USB ISR
-    spi_state: TransactionState,
+    /// Only modified in a USB interrupt context
+    transaction_state: TransactionState,
 
     devices: [&'a mut dyn SpiDevice; DEVICE_COUNT],
 
@@ -207,12 +209,14 @@ where
             device.deselect();
         }
 
-        let spi = spi_hardware
+        let mut spi = spi_hardware
             // TODO encode these in the device settings
             .cpol(Polarity::IdleHigh)
             .cpha(Phase::CaptureOnSecondTransition)
             .baud(1000.khz())
             .enable();
+
+        spi.enable_interrupts(Flags::RXC);
 
         Self {
             usb_interface: alloc.interface(),
@@ -224,8 +228,7 @@ where
             usb_to_spi_producer,
             usb_to_spi_consumer,
 
-            spi_state: TransactionState::new(),
-            usb_state: TransactionState::new(),
+            transaction_state: TransactionState::new(),
 
             write_state: WriteState::NotFull,
 
@@ -235,233 +238,228 @@ where
         }
     }
 
-    // TODO perhaps a better name
-    pub fn flush_usb(&mut self) {
-        match self.spi_to_usb_consumer.read() {
-            Ok(grant) => {
-                // Deciding what to write is a bit more complicated,
-                // due to the way USB bulk transfers work...
-                let full_packet_count = match self.write_state {
-                    WriteState::Full(c) => c,
-                    WriteState::NotFull => 0,
-                };
+    fn write_usb_in(&mut self, grant: GrantR<BufferSize>) {
+        let state = &mut self.transaction_state;
 
-                let max_write_size = if full_packet_count >= SHORT_PACKET_INTERVAL {
-                    ENDPOINT_SIZE - 1
-                } else {
-                    ENDPOINT_SIZE
-                };
+        let full_packet_count = match self.write_state {
+            WriteState::Full(c) => c,
+            WriteState::NotFull => 0,
+        };
 
-                let write_slice = if grant.buf().len() > max_write_size {
-                    grant.buf().split_at(max_write_size).0
-                } else {
-                    grant.buf()
-                };
+        let max_write_size = if full_packet_count >= SHORT_PACKET_INTERVAL {
+            ENDPOINT_SIZE - 1
+        } else {
+            ENDPOINT_SIZE
+        };
 
-                match self.write_endpoint.write(write_slice) {
-                    Ok(count) => {
-                        // TODO it would be nice to release only after we get
-                        // the endpoint_in_complete() callback, so we're sure
-                        // the data was read by the host.
-                        grant.release(count);
+        let write_slice = if grant.buf().len() > max_write_size {
+            grant.buf().split_at(max_write_size).0
+        } else {
+            grant.buf()
+        };
 
-                        self.usb_state.sent += count;
+        match self.write_endpoint.write(write_slice) {
+            Ok(count) => {
+                // TODO it would be nice to release only after we get
+                // the endpoint_in_complete() callback, so we're sure
+                // the data was read by the host.
+                grant.release(count);
+                state.from_spi += count;
 
-                        // Should only be here if direction is InOnly or Both,
-                        // because those are the only states that make data
-                        // available to spi_to_usb_consumer
-                        if self.usb_state.sent >= self.usb_state.expected {
-                            self.usb_state.direction = Direction::None;
-                        }
-
-                        self.write_state = if count >= ENDPOINT_SIZE {
-                            WriteState::Full(full_packet_count + 1)
-                        } else {
-                            WriteState::NotFull
-                        };
-                    }
-
-                    Err(UsbError::WouldBlock) => {}
-
-                    Err(_) => {
-                        defmt::error!("Error writing packet"); // TODO
-                    }
+                if state.from_spi > state.expected {
+                    defmt::panic!("Received more than expected from SPI InOnly|Both!");
+                    state.reset();
+                } else if state.from_spi == state.expected {
+                    // Normal end of a transaction
+                    state.reset();
                 }
+
+                self.write_state = if count >= ENDPOINT_SIZE {
+                    WriteState::Full(full_packet_count + 1)
+                } else {
+                    WriteState::NotFull
+                };
             }
 
-            // TODO is WriteState important now that we're not using CDC?
-            // No more data to write
-            Err(BBError::InsufficientSize) => {
-                if let WriteState::Full(_) = self.write_state {
-                    // Need to send a Zero Length Packet to
-                    // signal the end of a transaction
-                    match self.write_endpoint.write(&[]) {
-                        Ok(_) => {
-                            self.write_state = WriteState::NotFull;
-                        }
-                        Err(UsbError::WouldBlock) => {}
-                        Err(_) => {
-                            defmt::error!("Error writing ZLP"); // TODO
-                        }
-                    }
-                } else {
-                    self.write_state = WriteState::NotFull;
-                }
-            }
+            Err(UsbError::WouldBlock) => {}
 
             Err(_) => {
-                // TODO handle this better
-                defmt::error!("Couldn't get spi_to_usb_consumer grant");
+                defmt::error!("Error writing packet"); // TODO
             }
         }
     }
 
-    // TODO perhaps a better name
-    /// Attempts to write a out over SPI
-    ///
-    /// Can be entered in either a USB or SPI interrupt context.
-    fn flush_spi(&mut self) {
-        interrupt::free(|_| { // TODO time this... and/or implement the minimum level scheme
-            match self.spi_state.direction {
-                Direction::OutOnly | Direction::Both => {
-                    match self.usb_to_spi_consumer.read() {
-                        Ok(grant) => {
-                            // The buffer returned is guaranteed to have at least one byte
-                            match self.spi.send(grant.buf()[0]) {
-                                Ok(()) => {
-                                    self.spi_state.sent += 1;
+    // TODO perhaps a better name; also used in transactions that don't send USB
+    pub fn flush_usb(&mut self) {
+        let state = &mut self.transaction_state;
 
-                                    grant.release(1);  
-                                }
-                                Err(nb::Error::WouldBlock) => {
-                                    // SPI isn't ready for the next byte
-                                }
-                                Err(nb::Error::Other(SpiError::Overflow)) => {
-                                    defmt::error!("Overflow in flush_spi() Out|Both"); // TODO
-                                    self.spi.clear_errors(SpiErrors::BUFOVF);
-                                }
-                            };
-                        }
-                        Err(BBError::InsufficientSize) => {
-                            // There's no more data in the buffer to write
-                            // TODO We seem to get continual DRE callbacks; is that expected?
-                        }
-                        Err(BBError::GrantInProgress) => {
-                            // We'll hit this when the USB or SPI ISR interrupts the other;
-                            // it's effectively a mutex protecting the spi send call
-                            defmt::warn!("GrantInProgress in flush_spi()");
-                        }
-                        Err(BBError::AlreadySplit) => {
-                            unreachable!();
+        match state.direction {
+            Direction::None => {}
+            Direction::CsAssert | Direction::CsDeassert => {
+                defmt::error!("SPI-USB flush_usb() in unexpected state");
+            }
+            Direction::OutOnly => {
+                // Host isn't intersted in SPI reads
+                match self.spi_to_usb_consumer.read() {
+                    Ok(grant) => {
+                        let len = grant.buf().len();
+                        state.from_spi += len;
+                        grant.release(len);
+
+                        if state.from_spi > state.expected {
+                            defmt::panic!("Received more than expected from SPI OutOnly!");
+                            state.reset();
+                        } else if state.from_spi == state.expected {
+                            // Normal end of a transaction
+                            state.reset();
                         }
                     }
-                }
-                Direction::InOnly => {
-                    if self.spi_state.sent < self.spi_state.expected {
-                        match self.spi.send(USB_SPI_TX_FILL) {
-                            Ok(()) => {
-                                self.spi_state.sent += 1;
-                            }
-                            Err(nb::Error::WouldBlock) => {
-                                // SPI isn't ready for the next byte
-                            }
-                            Err(nb::Error::Other(SpiError::Overflow)) => {
-                                defmt::error!("Overflow in flush_spi() Direction::InOnly"); // TODO
-                                self.spi.clear_errors(SpiErrors::BUFOVF);
-                            }
-                        };
-                    }
-                }
-                Direction::CsAssert | Direction::CsDeassert => {
-                    defmt::warn!("USB-SPI had spi_state set to strange value");
-                }
-                Direction::None => {
-                    // defmt::info!("In flush_spi() with Direction::None");
+                    _ => {}
                 }
             }
-        });
+            Direction::InOnly | Direction::Both => {
+                if state.direction == Direction::InOnly && state.expected < state.from_usb {
+                    let remaining = state.expected - state.from_usb;
+                    if let Ok(mut grant) = self.usb_to_spi_producer.grant_max_remaining(remaining) {
+                        let generated = grant.buf().len();
+
+                        for b in grant.buf() {
+                            *b = USB_SPI_TX_FILL;
+                        }
+
+                        grant.commit(generated);
+                        state.from_usb += generated;
+                        self.spi.enable_interrupts(Flags::DRE);
+                    }
+                }
+                match self.spi_to_usb_consumer.read() {
+                    Ok(grant) => {
+                        self.write_usb_in(grant);
+                    }
+        
+                    // TODO is WriteState important now that we're not using CDC?
+                    // No more data to write
+                    Err(BBError::InsufficientSize) => {
+                        if let WriteState::Full(_) = self.write_state {
+                            // Need to send a Zero Length Packet to
+                            // signal the end of a transaction
+                            match self.write_endpoint.write(&[]) {
+                                Ok(_) => {
+                                    self.write_state = WriteState::NotFull;
+                                }
+                                Err(UsbError::WouldBlock) => {}
+                                Err(_) => {
+                                    defmt::error!("Error writing ZLP"); // TODO
+                                }
+                            }
+                        } else {
+                            self.write_state = WriteState::NotFull;
+                        }
+                    }
+        
+                    Err(_) => {
+                        // TODO handle this better
+                        defmt::error!("Couldn't get spi_to_usb_consumer grant");
+                    }
+                }
+            }
+        }
     }
 
     // TODO split this in to another struct so users don't need two ISRs that both reference Self
+    /// This is only ever called in an SPI interrupt context
     pub fn spi_callback(&mut self) {
-        match self.spi_state.direction {
-            Direction::InOnly | Direction::Both => {
-                match self.spi_to_usb_producer.grant_exact(1) {
-                    Ok(mut grant) => {
-                        match self.spi.read() {
-                            Ok(c) => {
-                                defmt::info!("Read {:X}", c);
-                                grant.buf()[0] = c;
-                                grant.commit(1);
-        
-                                self.spi_state.received += 1;
+        match self.spi_to_usb_producer.grant_exact(1) {
+            Ok(mut grant) => {
+                let mut clear_count = 0;
+                loop {
+                    match self.spi.read() {
+                        Ok(c) => {
+                            defmt::info!("SPI read {:X}", c);
+                            grant.buf()[0] = c;
+                            grant.commit(1);
+                            break;
+                        }
+                        Err(nb::Error::WouldBlock) => {
+                            // Nothing to read here
+                            // Drop the grant without committing
+                            break;
+                        }
+                        Err(nb::Error::Other(SpiError::Overflow)) => {
+                            if clear_count > 0 {
+                                panic!("Cleared already");
                             }
-                            Err(nb::Error::WouldBlock) => {
-                                // Nothing to read here
-                                // Drop the grant without committing
-                            }
-                            Err(nb::Error::Other(SpiError::Overflow)) => {
-                                defmt::error!("SPI Overflow in callback InOnly|Both"); // TODO
-                                self.spi.clear_errors(SpiErrors::BUFOVF);
-                            }
+                            defmt::error!("SPI Overflow in callback read"); // TODO
+                            self.spi.clear_errors(SpiErrors::BUFOVF);
+                            clear_count += 1;
                         }
                     }
-                    Err(_) => {
-                        // TODO better error reporting
-                        defmt::error!("SPI->USB overflow");
-                        panic!("Bam");
+                }
+            }
+            Err(BBError::InsufficientSize) => {
+                // TODO better error reporting
+                defmt::error!("SPI->USB overflow");
+                let mut clear_count = 0;
+                loop {
+                    match self.spi.read() {
+                        Ok(c) => {
+                            defmt::info!("SPI discard {:X}", c);
+                            break;
+                        }
+                        Err(nb::Error::WouldBlock) => {
+                            // Nothing to read here
+                            // Drop the grant without committing
+                            break;
+                        }
+                        Err(nb::Error::Other(SpiError::Overflow)) => {
+                            if clear_count > 0 {
+                                panic!("Cleared already");
+                            }
+                            defmt::error!("SPI Overflow in callback discard"); // TODO
+                            self.spi.clear_errors(SpiErrors::BUFOVF);
+                            clear_count += 1;
+                        }
                     }
                 }
             }
-
-            Direction::OutOnly | Direction::None => {
-                match self.spi.read() {
-                    Ok(_) => {
-                        self.spi_state.received += 1;
-                        // if self.spi_state.direction == Direction::None {
-                        //     defmt::info!("Dropped None {:X}", c);
-                        // } else {
-                        //     defmt::info!("Dropped OutOnly {:X}", c);
-                        // }
-                        // if self.spi_state.direction == Direction::OutOnly {
-                        //     self.spi_state.received += 1;
-                        // }
-                    }
-                    Err(nb::Error::WouldBlock) => {
-                        // Nothing to read here
-                    }
-                    Err(nb::Error::Other(SpiError::Overflow)) => {
-                        defmt::error!("SPI Overflow in callback OutOnly|None"); // TODO
-                        self.spi.clear_errors(SpiErrors::BUFOVF);
-                    }
-                }
+            Err(BBError::GrantInProgress) => {
+                defmt::panic!("GrantInProgress in spi_callback()"); // TODO
             }
-
-            Direction::CsAssert | Direction::CsDeassert => {
-                defmt::warn!("USB-SPI had spi_state set to strange value");
+            Err(BBError::AlreadySplit) => {
+                unreachable!();
             }
         }
 
-        self.flush_spi();
-
-        if match self.spi_state.direction {
-            Direction::Both => {
-                self.spi_state.expected == self.spi_state.sent
-                && self.spi_state.expected == self.spi_state.received
+        match self.usb_to_spi_consumer.read() {
+            Ok(grant) => {
+                // The buffer returned is guaranteed to have at least one byte
+                match self.spi.send(grant.buf()[0]) {
+                    Ok(()) => {
+                        // defmt::info!("SPI write {:X}, len {:?}", grant.buf()[0], grant.buf().len()); // TODO
+                        if grant.buf().len() == 1 {
+                            self.spi.disable_interrupts(Flags::DRE);
+                        }
+                        grant.release(1);
+                    }
+                    Err(nb::Error::WouldBlock) => {
+                        // SPI isn't ready for the next byte
+                    }
+                    Err(nb::Error::Other(SpiError::Overflow)) => {
+                        defmt::error!("SPI Overflow in callback write"); // TODO
+                        self.spi.clear_errors(SpiErrors::BUFOVF);
+                    }
+                };
             }
-            Direction::InOnly => {
-                self.spi_state.expected == self.spi_state.received
+            Err(BBError::InsufficientSize) => {
+                // There's no more data in the buffer to write
+                self.spi.disable_interrupts(Flags::DRE);
             }
-            Direction::OutOnly => {
-                defmt::info!("End of OutOnly ISR, expected:{:?} sent:{:?}", self.spi_state.expected, self.spi_state.sent);
-                self.spi_state.expected == self.spi_state.sent
+            Err(BBError::GrantInProgress) => {
+                defmt::panic!("GrantInProgress in spi_callback()"); // TODO
             }
-            _ => {
-                false
+            Err(BBError::AlreadySplit) => {
+                unreachable!();
             }
-        } {
-            self.spi.disable_interrupts(Flags::RXC); // Not yet clear why this is necessary
-            self.spi_state.direction = Direction::None;
         }
     }
 
@@ -477,6 +475,113 @@ where
                 self.selected_device = device_index;
             }
         });
+    }
+
+    /// Process a USB packet that starts a new transaction
+    fn start_transaction(&mut self, mut grant: GrantW<BufferSize>) {
+        let mut buf = [0u8; ENDPOINT_SIZE];
+        // This is rather inefficient; there's a memcpy() in the read(), then we do it again...
+        match self.read_endpoint.read(&mut buf) {
+            Ok(count) => {
+                if let Some(header) = TransferHeader::decode(&buf[..count]) {                   
+                    let direction = header.direction;
+                    let header_len = core::mem::size_of::<TransferHeader>();
+
+                    // These differ if the SPI transfer is bigger than a USB packet
+                    let expected = header.bytes as usize;
+                    let received = count - header_len;
+
+                    match direction {
+                        Direction::OutOnly | Direction::Both =>  {
+                            defmt::info!("starting OutOnly|Both transaction");
+
+                            grant.buf()[..received].copy_from_slice(&buf[header_len..count]);
+                            grant.commit(received);
+
+                            self.transaction_state.direction = direction;
+                            self.transaction_state.expected = expected;
+                            self.transaction_state.from_usb = received;
+                            self.transaction_state.from_spi = 0;
+
+                            self.spi.enable_interrupts(Flags::DRE);
+                        }
+                        Direction::InOnly => {
+                            defmt::info!("starting InOnly transaction");
+
+                            let generated = expected.min(grant.buf().len());
+
+                            for b in &mut grant.buf()[..generated] {
+                                *b = USB_SPI_TX_FILL;
+                            }
+                            grant.commit(generated);
+
+                            self.transaction_state.direction = direction;
+                            self.transaction_state.expected = expected;
+                            self.transaction_state.from_usb = generated;
+                            self.transaction_state.from_spi = 0;
+
+                            self.spi.enable_interrupts(Flags::DRE);
+                        }
+                        Direction::None => {
+                            defmt::error!("starting no transaction!?");
+                            return;
+                            // TODO
+                        }
+                        Direction::CsAssert => {
+                            defmt::info!("Asserting chip select");
+
+                            let slave_index = usize::from(header.bytes);
+                            if slave_index < self.devices.len() {
+                                self.select(Some(slave_index));
+                            } else {
+                                // TODO log error
+                                defmt::error!("Got an invalid slave ID");
+                            }
+                            return;
+                        }
+                        Direction::CsDeassert => {
+                            defmt::info!("Deasserting chip selects");
+                            self.select(None);
+                            return;
+                        }
+                    }
+                } else {
+                    // Header failed to decode
+                    unimplemented!();
+                }
+            }
+            Err(UsbError::WouldBlock) => {
+                // No data to read from endpoint, just drop the grant
+            }
+            Err(_) => {
+                // TODO handle this better
+                defmt::error!("Error reading OUT data");
+            }
+        }
+    }
+
+    /// Process a USB packet that provides more OUT/MOSI data
+    fn continue_transaction(&mut self, mut grant: GrantW<BufferSize>) {
+        match self.read_endpoint.read(grant.buf()) {
+            Ok(count) => {
+                grant.commit(count);
+
+                self.transaction_state.from_usb += count;
+
+                if self.transaction_state.from_usb > self.transaction_state.expected {
+                    defmt::warn!("Received more than expected amount of data over USB");
+                }
+
+                self.spi.enable_interrupts(Flags::DRE);
+            }
+            Err(UsbError::WouldBlock) => {
+                // No data to read, just drop the grant
+            }
+            Err(_) => {
+                // TODO handle this better
+                defmt::error!("Error reading OUT data");
+            }
+        }
     }
 }
 
@@ -500,9 +605,7 @@ where
     }
 
     fn reset(&mut self) {
-        // TODO
-        // self.read_buf.clear();
-        // self.write_buf.clear();
+        // TODO disable the SPI hardware while doing this
         loop {
             match self.spi_to_usb_consumer.read() {
                 Ok(grant) => {
@@ -535,8 +638,7 @@ where
         }
 
         self.write_state = WriteState::NotFull;
-        self.spi_state = TransactionState::new();
-        self.usb_state = TransactionState::new();
+        self.transaction_state.reset();
     }
 
     fn endpoint_out(&mut self, addr: EndpointAddress) {
@@ -546,133 +648,33 @@ where
 
         // Make sure we've got space to store new data, because once the
         // endpoint is read, the host can overwrite whatever data is in it.
-        if let Ok(mut grant) =  self.usb_to_spi_producer.grant_exact(ENDPOINT_SIZE) {
-            let mut start_transaction = false;
-            let mut continue_transaction = false;
-            
-            match (self.usb_state.direction, self.spi_state.direction) {
-                (Direction::None, Direction::None) => {
-                    // Normal start to a transaction, should receive a header
-                    start_transaction = true;
+        if let Ok(grant) = self.usb_to_spi_producer.grant_exact(ENDPOINT_SIZE) {
+            match self.transaction_state.direction {
+                Direction::None => {
+                    self.start_transaction(grant);
                 }
 
-                (Direction::OutOnly, Direction::OutOnly) | (Direction::Both, Direction::Both) => {
-                    defmt::info!("continuing transaction"); // TODO
-                    // More data for an ongoing transaction
-                    continue_transaction = true;
+                Direction::OutOnly | Direction::Both => {
+                    if self.transaction_state.expected > self.transaction_state.from_usb {
+                        self.continue_transaction(grant);
+                    }
                 }
 
-                (Direction::None, Direction::OutOnly) => {
-                    // Waiting for an OutOnly transaction to finish
-                    defmt::warn!("Ignoring USB OUT while waiting for SPI");
+                Direction::InOnly => {
+                    // Waiting for an InOnly transaction to finish
                 }
 
-                _ => {
+                Direction::CsAssert | Direction::CsDeassert => {
                     // TODO 
-                    defmt::warn!("Ignoring USB OUT transfer when in an invalid state {:?} {:?}",
-                                    self.usb_state.direction as usize, self.spi_state.direction as usize);
+                    defmt::warn!("Ignoring USB OUT transfer when in an invalid state {:?}",
+                                    self.transaction_state.direction as usize);
                 }
-            }
-
-            if start_transaction || continue_transaction {
-                let mut buf = [0u8; ENDPOINT_SIZE];
-                match self.read_endpoint.read(&mut buf) { // TODO read straight in to the bbqueue if continuing
-                    Ok(count) => {
-                        if start_transaction {
-                            if let Some(header) = TransferHeader::decode(&buf[..count]) {
-                                let header_len = core::mem::size_of::<TransferHeader>();
-                    
-                                let direction = header.direction;
-
-                                // match direction {
-                                //     Direction::OutOnly =>  {
-                                //         defmt::info!("starting OutOnly transaction");
-                                //     }
-                                //     Direction::InOnly => {
-                                //         defmt::info!("starting InOnly transaction");
-                                //     }
-                                //     Direction::Both => {
-                                //         defmt::info!("starting Both transaction");
-                                //     }
-                                //     Direction::None => {
-                                //         defmt::error!("No transaction!?");
-                                //         // TODO
-                                //     }
-                                // }
-
-                                if direction == Direction::CsDeassert {
-                                    self.select(None);
-                                    return;
-                                }
-
-                                if direction == Direction::CsAssert {
-                                    let slave_index = usize::from(header.bytes);
-                                    if slave_index < self.devices.len() {
-                                        self.select(Some(slave_index));
-                                    } else {
-                                        // TODO log error
-                                        defmt::error!("Got an invalid slave ID");
-                                    }
-                                    return;
-                                }
-
-                                // These differ if the SPI transfer is bigger than a USB packet
-                                let expected = header.bytes as usize;
-                                let received = count - header_len;
-            
-                                if direction == Direction::OutOnly || direction == Direction::Both {
-                                    grant.buf()[0..received].copy_from_slice(&buf[header_len..count]);
-                                    grant.commit(received);
-                                }
-            
-                                self.usb_state.direction = direction;
-                                self.usb_state.expected = expected;
-                                self.usb_state.received = received;
-                                self.usb_state.sent = 0;
-            
-                                self.spi_state.direction = direction;
-                                self.spi_state.expected = expected;
-                                self.spi_state.received = 0;
-                                self.spi_state.sent = 0;
-
-                                self.spi.enable_interrupts(Flags::RXC);
-                            } else {
-                                // Header failed to decode
-                                unimplemented!();
-                            }
-                        } else {
-                            // Continuing an existing transaction
-                            grant.buf()[..count].copy_from_slice(&buf[..count]);
-                            grant.commit(count);
-
-                            self.usb_state.received += count;
-                        }
-
-                        if self.usb_state.direction == Direction::OutOnly
-                            && self.usb_state.expected == self.usb_state.received {
-                            self.usb_state.direction = Direction::None;
-                        }
-        
-                        self.flush_spi(); // NOP if the SPI is already busy
-                    }
-                    Err(UsbError::WouldBlock) => {
-                        // No data to read, just drop the grant
-                    }
-                    Err(_) => {
-                        // TODO handle this better
-                        defmt::error!("Error reading OUT data");
-                    }
-                }
-            } else {
-                // Since we don't have anywhere to put more data, we can't read
-                // data out of the USB endpoint.
-
-                self.flush_spi(); // Ensure we continue draining the buffer
             }
         }
     }
 
     fn poll(&mut self) {
+
         self.flush_usb();
     }
 
