@@ -39,7 +39,7 @@ static int test_driver_probe(struct spi_device *dev)
 	if (ret >= 0) {
 		ret = spi_read(dev, buf, 5);
 
-		printk(KERN_INFO "Read: 0x%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+		dev_info(&dev->dev, "Read: 0x%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
 			buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]);
 	}
 

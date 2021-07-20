@@ -143,10 +143,6 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 
 		memcpy(usb_spi->usb_buffer + sizeof(*header), xfer->tx_buf + offset, data_len);
 
-		if (data_len == 1) { // TODO
-			dev_warn(&usb_spi->usb_dev->dev, "sending 0x%02X", ((char *)usb_spi->usb_buffer)[sizeof(*header)]);
-		}
-
 	} else if (xfer->rx_buf) {
 		data_len = min(data_len, usb_spi->usb_buf_sz);
 		data_len = min(data_len, usb_spi->hardware_buf_size);
@@ -193,9 +189,6 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 			if (ret < 0 && ret != -ETIMEDOUT) {
 				dev_err(&usb_spi->usb_dev->dev, "Error receiving bulk IN: %s (%d)", error_to_string(ret), ret);
 				goto err;
-			}
-			if (actual_len > 0) {
-				dev_warn(&usb_spi->usb_dev->dev, "Received %dB 0x%02X", actual_len, ((char *)usb_spi->usb_buffer)[0]); // TODO
 			}
 		}
 	}
@@ -254,9 +247,6 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 	struct spi_transfer *xfer = NULL;
 	int ret = 0;
 
-	dev_info(&usb_spi->usb_dev->dev, "usb_spi_transfer_one_message() CS:%d",
-	         mesg->spi->chip_select); // TODO
-
 	mutex_lock(&usb_spi->usb_mutex);
 
 	ret = usb_spi_chip_select(usb_spi, mesg->spi->chip_select);
@@ -297,18 +287,6 @@ err:
 	spi_finalize_current_message(master);
 	return ret;
 }
-
-static struct spi_board_info spi_board_info[] = {
-{
-        .modalias       = "spi-test",
-        // .platform_data  = &ads_info,
-        .mode           = SPI_MODE_0,
-        // .irq            = 1234,
-        .max_speed_hz   = 120000 /* max sample rate at 3V */ * 16,
-        .bus_num        = 1,
-        .chip_select    = 0,
-},
-};
 
 /// Returns 0 on success, or negative error code
 static int usb_spi_get_master_info(struct usb_spi_device *usb_spi)
@@ -457,6 +435,8 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 
 	// TODO this needs to be in a separate method
 	for (i = 0; i < usb_spi->connected_count; ++i) {
+		struct spi_board_info board_info = {0};
+
 		// Slight chicken-and-egg problem here: we need to read in devices to
 		// determine if they provide IRQs, so we don't know how many IRQs to
 		// allocate.  Add an irq_count field, then fetch each?
@@ -479,14 +459,18 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		}
 
 		if (slave_info->has_interrupt) {
-			dev_info(&usb_spi->usb_dev->dev, "\t\"%s\", has interrupt", slave_info->modalias);
+			dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d, has interrupt", slave_info->modalias, i);
 		} else {
-			dev_info(&usb_spi->usb_dev->dev, "\t\"%s\"", slave_info->modalias);
+			dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d", slave_info->modalias, i);
 		}
+
+		strncpy(board_info.modalias, slave_info->modalias, sizeof(board_info.modalias));
+		board_info.bus_num = spi_master->bus_num;
+		board_info.chip_select = i;
+
 		mutex_unlock(&usb_spi->usb_mutex);
 
-		// TODO populate spi_board_info from the slave info
-		spi_new_device(spi_master, spi_board_info);
+		spi_new_device(spi_master, &board_info);
 	}
 
 	usb_set_intfdata(usb_if, usb_spi);
