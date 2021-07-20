@@ -371,9 +371,29 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 	usb_spi->usb_dev = usb_dev;
 	usb_spi->usb_interface_index = usb_if->cur_altsetting->desc.bInterfaceNumber;
 
-	// Find size of biggest endpoint we'll deal with
-	ret = usb_find_common_endpoints(usb_if->cur_altsetting, &ep_in, &ep_out, NULL, NULL);
-	if (ret) {
+	// usb_find_common_endpoints() isn't available in old kernels, so reinvent that wheel
+	for (i = 0; i < usb_if->cur_altsetting->desc.bNumEndpoints; ++i) {
+		struct usb_endpoint_descriptor *desc = &usb_if->cur_altsetting->endpoint[i].desc;
+		if (usb_endpoint_type(desc) == USB_ENDPOINT_XFER_BULK) {
+			if (usb_endpoint_dir_in(desc)) {
+				if (ep_in == NULL) {
+					ep_in = desc;
+				} else {
+					dev_err(&usb_dev->dev, "Multiple IN endpoint descriptors");
+					ret = -EINVAL;
+					goto err;
+				}
+			} else if (ep_out == NULL) {
+				ep_out = desc;
+			} else {
+				dev_err(&usb_dev->dev, "Multiple OUT endpoint descriptors");
+				ret = -EINVAL;
+				goto err;
+			}
+		}
+	}
+
+	if (ep_in == NULL || ep_out == NULL) {
 		// TODO Support half-duplex with only one bulk endpoint
 		dev_err(&usb_dev->dev, "Missing/corrupt bulk endpoint descriptors");
 		goto err;
