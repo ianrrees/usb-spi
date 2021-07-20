@@ -182,7 +182,6 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 		while (read_len < data_len) {
 			actual_len = 0;
 			// TODO shorter timeout? need to loop on this, could predict time required if we knew baud
-			dev_info(&usb_spi->usb_dev->dev, "Starting read read_len:%d data_len:%d", read_len, data_len);
 			ret = usb_bulk_msg(usb_spi->usb_dev,
 			                   usb_spi->bulk_in_pipe,
 							   usb_spi->usb_buffer,

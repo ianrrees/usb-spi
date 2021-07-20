@@ -238,6 +238,7 @@ where
         }
     }
 
+    /// Helper for flush_usb() when in state InOnly Both transaction states
     fn write_usb_in(&mut self, grant: GrantR<BufferSize>) {
         let state = &mut self.transaction_state;
 
@@ -267,7 +268,7 @@ where
                 state.from_spi += count;
 
                 if state.from_spi > state.expected {
-                    defmt::panic!("Received more than expected from SPI InOnly|Both!");
+                    defmt::error!("Received more than expected from SPI InOnly|Both!");
                     state.reset();
                 } else if state.from_spi == state.expected {
                     // Normal end of a transaction
@@ -307,7 +308,7 @@ where
                         grant.release(len);
 
                         if state.from_spi > state.expected {
-                            defmt::panic!("Received more than expected from SPI OutOnly!");
+                            defmt::error!("Received more than expected from SPI OutOnly!");
                             state.reset();
                         } else if state.from_spi == state.expected {
                             // Normal end of a transaction
@@ -332,13 +333,14 @@ where
                         self.spi.enable_interrupts(Flags::DRE);
                     }
                 }
+
                 match self.spi_to_usb_consumer.read() {
                     Ok(grant) => {
                         self.write_usb_in(grant);
                     }
         
                     // TODO is WriteState important now that we're not using CDC?
-                    // No more data to write
+                    // No more SPI data to write over USB
                     Err(BBError::InsufficientSize) => {
                         if let WriteState::Full(_) = self.write_state {
                             // Need to send a Zero Length Packet to
@@ -371,54 +373,30 @@ where
     pub fn spi_callback(&mut self) {
         match self.spi_to_usb_producer.grant_exact(1) {
             Ok(mut grant) => {
-                let mut clear_count = 0;
-                loop {
-                    match self.spi.read() {
-                        Ok(c) => {
-                            defmt::info!("SPI read {:X}", c);
-                            grant.buf()[0] = c;
-                            grant.commit(1);
-                            break;
-                        }
-                        Err(nb::Error::WouldBlock) => {
-                            // Nothing to read here
-                            // Drop the grant without committing
-                            break;
-                        }
-                        Err(nb::Error::Other(SpiError::Overflow)) => {
-                            if clear_count > 0 {
-                                panic!("Cleared already");
-                            }
-                            defmt::error!("SPI Overflow in callback read"); // TODO
-                            self.spi.clear_errors(SpiErrors::BUFOVF);
-                            clear_count += 1;
-                        }
+                match self.spi.read() {
+                    Ok(c) => {
+                        grant.buf()[0] = c;
+                        grant.commit(1);
+                    }
+                    Err(nb::Error::WouldBlock) => {
+                        // Nothing to read from SPI
+                        // Drop the grant without committing
+                    }
+                    Err(nb::Error::Other(SpiError::Overflow)) => {
+                        defmt::error!("SPI Overflow in callback read"); // TODO
+                        self.spi.clear_errors(SpiErrors::BUFOVF);
                     }
                 }
             }
             Err(BBError::InsufficientSize) => {
                 // TODO better error reporting
                 defmt::error!("SPI->USB overflow");
-                let mut clear_count = 0;
-                loop {
-                    match self.spi.read() {
-                        Ok(c) => {
-                            defmt::info!("SPI discard {:X}", c);
-                            break;
-                        }
-                        Err(nb::Error::WouldBlock) => {
-                            // Nothing to read here
-                            // Drop the grant without committing
-                            break;
-                        }
-                        Err(nb::Error::Other(SpiError::Overflow)) => {
-                            if clear_count > 0 {
-                                panic!("Cleared already");
-                            }
-                            defmt::error!("SPI Overflow in callback discard"); // TODO
-                            self.spi.clear_errors(SpiErrors::BUFOVF);
-                            clear_count += 1;
-                        }
+                match self.spi.read() {
+                    Ok(_discard) => {}
+                    Err(nb::Error::WouldBlock) => {}
+                    Err(nb::Error::Other(SpiError::Overflow)) => {
+                        defmt::error!("SPI Overflow in callback discard");
+                        self.spi.clear_errors(SpiErrors::BUFOVF);
                     }
                 }
             }
@@ -435,10 +413,8 @@ where
                 // The buffer returned is guaranteed to have at least one byte
                 match self.spi.send(grant.buf()[0]) {
                     Ok(()) => {
-                        // defmt::info!("SPI write {:X}, len {:?}", grant.buf()[0], grant.buf().len()); // TODO
-                        if grant.buf().len() == 1 {
-                            self.spi.disable_interrupts(Flags::DRE);
-                        }
+                        // Don't be tempted to disable DRE here; the ring buffer
+                        // could have more data after a wrap.
                         grant.release(1);
                     }
                     Err(nb::Error::WouldBlock) => {
@@ -493,8 +469,6 @@ where
 
                     match direction {
                         Direction::OutOnly | Direction::Both =>  {
-                            defmt::info!("starting OutOnly|Both transaction");
-
                             grant.buf()[..received].copy_from_slice(&buf[header_len..count]);
                             grant.commit(received);
 
@@ -506,8 +480,6 @@ where
                             self.spi.enable_interrupts(Flags::DRE);
                         }
                         Direction::InOnly => {
-                            defmt::info!("starting InOnly transaction");
-
                             let generated = expected.min(grant.buf().len());
 
                             for b in &mut grant.buf()[..generated] {
@@ -528,19 +500,16 @@ where
                             // TODO
                         }
                         Direction::CsAssert => {
-                            defmt::info!("Asserting chip select");
-
                             let slave_index = usize::from(header.bytes);
                             if slave_index < self.devices.len() {
                                 self.select(Some(slave_index));
                             } else {
                                 // TODO log error
-                                defmt::error!("Got an invalid slave ID");
+                                defmt::error!("Got an invalid slave ID {:?}", slave_index);
                             }
                             return;
                         }
                         Direction::CsDeassert => {
-                            defmt::info!("Deasserting chip selects");
                             self.select(None);
                             return;
                         }
