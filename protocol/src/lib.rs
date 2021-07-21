@@ -1,6 +1,4 @@
 #![no_std]
-#![allow(non_camel_case_types, dead_code)]
-
 
 /// Protocol used between the USB host and device, for USB-SPI
 
@@ -89,13 +87,15 @@ impl ConnectedSlaveInfoLinux {
 
 #[repr(u8)]
 pub enum EventType {
-    NONE,
+    NoEvent,
+    Interrupt,
 }
 
 #[repr(C)]
 pub struct Event {
-    pub event: EventType,
-    // TODO more fields, FIFO like Miss Thripp?
+    pub event_type: EventType,
+    /// For types like Interrupt, this conveys which device is interrupting
+    pub data: u16,
 }
 
 /// Used as the request field of IN control transfers
@@ -103,10 +103,10 @@ pub struct Event {
 #[repr(u8)]
 pub enum ControlIn {
     // TODO rename these to fit Rust conventions
-    REQUEST_IN_HW_INFO,
-    REQUEST_IN_GET_EVENT,
+    HwInfo,
+    GetEvent,
     /// Slave ID is sent in the value field
-    REQUEST_IN_LINUX_SLAVE_INFO,
+    LinuxSlaveInfo,
 }
 
 // /// Used as the request field of OUT control transfers

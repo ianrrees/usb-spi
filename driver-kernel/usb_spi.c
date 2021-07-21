@@ -134,9 +134,9 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 		data_len = min(data_len, usb_spi->usb_buf_sz - (unsigned)sizeof(*header));
 		if (xfer->rx_buf) {
 			data_len = min(data_len, usb_spi->hardware_buf_size);
-			header->direction = Both;
+			header->direction = usb_spi_Direction_Both;
 		} else {
-			header->direction = OutOnly;
+			header->direction = usb_spi_Direction_OutOnly;
 		}
 		header->bytes = data_len;
 		out_len = sizeof(*header) + data_len;
@@ -146,7 +146,7 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 	} else if (xfer->rx_buf) {
 		data_len = min(data_len, usb_spi->usb_buf_sz);
 		data_len = min(data_len, usb_spi->hardware_buf_size);
-		header->direction = InOnly;
+		header->direction = usb_spi_Direction_InOnly;
 		header->bytes = data_len;
 		out_len = sizeof(header);
 
@@ -209,7 +209,7 @@ static int usb_spi_chip_select(struct usb_spi_device *usb_spi, int chip_select) 
 	memset(header, 0, sizeof(*header));
 
 	if (chip_select < 0) {
-		header->direction = CsDeassert;
+		header->direction = usb_spi_Direction_CsDeassert;
 
 	} else if (chip_select >= usb_spi->connected_count) {
 		dev_err(&usb_spi->usb_dev->dev,
@@ -219,7 +219,7 @@ static int usb_spi_chip_select(struct usb_spi_device *usb_spi, int chip_select) 
 		goto err;
 
 	} else {
-		header->direction = CsAssert;
+		header->direction = usb_spi_Direction_CsAssert;
 		header->bytes = chip_select;
 	}
 
@@ -296,19 +296,19 @@ static int usb_spi_get_master_info(struct usb_spi_device *usb_spi)
 	struct usb_spi_MasterInfo *info = usb_spi->usb_buffer;
 	mutex_lock(&usb_spi->usb_mutex);
 
-	ret = usb_spi_control_in(usb_spi, REQUEST_IN_HW_INFO, 0, info, sizeof(*info));
+	ret = usb_spi_control_in(usb_spi, usb_spi_ControlIn_HwInfo, 0, info, sizeof(*info));
 	if (ret < 0) {
-		dev_err(&usb_spi->usb_dev->dev, "Control IN REQUEST_IN_HW_INFO failed %d: %s", ret, error_to_string(ret));
+		dev_err(&usb_spi->usb_dev->dev, "Control IN HwInfo failed %d: %s", ret, error_to_string(ret));
 		goto err;
 	} else if (ret != sizeof(*info)) {
-		dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to REQUEST_IN_HW_INFO", ret);
+		dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to HwInfo", ret);
 		ret = -EINVAL;
 		goto err;
 	} else {
 		ret = 0;
 	}
 
-	if (info->hardware != SpiMaster) {
+	if (info->hardware != usb_spi_HardwareType_SpiMaster) {
 		dev_err(&usb_spi->usb_dev->dev, "Device isn't an SPI master, unsupported");
 		ret = -EINVAL;
 		goto err;
@@ -445,13 +445,13 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		struct usb_spi_ConnectedSlaveInfoLinux *slave_info = usb_spi->usb_buffer;
 		mutex_lock(&usb_spi->usb_mutex);
 
-		ret = usb_spi_control_in(usb_spi, REQUEST_IN_LINUX_SLAVE_INFO, i, slave_info, sizeof(*slave_info));
+		ret = usb_spi_control_in(usb_spi, usb_spi_ControlIn_LinuxSlaveInfo, i, slave_info, sizeof(*slave_info));
 		if (ret < 0) {
-			dev_err(&usb_spi->usb_dev->dev, "Control IN REQUEST_IN_LINUX_SLAVE_INFO failed %d: %s", ret, error_to_string(ret));
+			dev_err(&usb_spi->usb_dev->dev, "Control IN LinuxSlaveInfo failed %d: %s", ret, error_to_string(ret));
 			mutex_unlock(&usb_spi->usb_mutex);
 			goto err;
 		} else if (ret != sizeof(*slave_info)) {
-			dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to REQUEST_IN_LINUX_SLAVE_INFO", ret);
+			dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to LinuxSlaveInfo", ret);
 			ret = -EINVAL;
 			goto err;
 		} else {

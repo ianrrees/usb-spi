@@ -667,7 +667,7 @@ where
         //     u8::from(self.usb_interface), req.request_type == control::RequestType::Vendor, req.index, req.request, req.value);
 
         match protocol::ControlIn::n(req.request) {
-            Some(protocol::ControlIn::REQUEST_IN_HW_INFO) => {
+            Some(protocol::ControlIn::HwInfo) => {
                 xfer.accept(|buf| 
                     Ok(protocol::MasterInfo::new(self.devices.len() as u16, BufferSize::to_u16())
                        .encode(buf))
@@ -675,10 +675,10 @@ where
                     defmt::error!("USB-SPI Failed to accept REQUEST_IN_HW_INFO")
                 });
             }
-            Some(protocol::ControlIn::REQUEST_IN_GET_EVENT) => {
+            Some(protocol::ControlIn::GetEvent) => {
                 unimplemented!();
             }
-            Some(protocol::ControlIn::REQUEST_IN_LINUX_SLAVE_INFO) => {
+            Some(protocol::ControlIn::LinuxSlaveInfo) => {
                 let i = usize::from(req.value);
                 if i < self.devices.len() {
                     xfer.accept(|buf|

@@ -11,4 +11,4 @@ enumn = "0.1"
 
 [build-dependencies]
 # Used by build.rs to create the C header file
-cbindgen = "0.17.0"
+cbindgen = "0.19.0"
