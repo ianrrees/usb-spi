@@ -138,7 +138,7 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 		} else {
 			header->direction = usb_spi_Direction_OutOnly;
 		}
-		header->bytes = data_len;
+		header->bytes = cpu_to_le16(data_len);
 		out_len = sizeof(*header) + data_len;
 
 		memcpy(usb_spi->usb_buffer + sizeof(*header), xfer->tx_buf + offset, data_len);
@@ -147,7 +147,7 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 		data_len = min(data_len, usb_spi->usb_buf_sz);
 		data_len = min(data_len, usb_spi->hardware_buf_size);
 		header->direction = usb_spi_Direction_InOnly;
-		header->bytes = data_len;
+		header->bytes = cpu_to_le16(data_len);
 		out_len = sizeof(header);
 
 	} else {
@@ -220,7 +220,7 @@ static int usb_spi_chip_select(struct usb_spi_device *usb_spi, int chip_select) 
 
 	} else {
 		header->direction = usb_spi_Direction_CsAssert;
-		header->bytes = chip_select;
+		header->bytes = cpu_to_le16(chip_select);
 	}
 
 	while (total_len < sizeof(*header)) {
@@ -315,8 +315,8 @@ static int usb_spi_get_master_info(struct usb_spi_device *usb_spi)
 	}
 
 	usb_spi->selected_chip = -1;
-	usb_spi->connected_count = info->slave_count;
-	usb_spi->hardware_buf_size = info->in_buf_size;
+	usb_spi->connected_count = le16_to_cpu(info->slave_count);
+	usb_spi->hardware_buf_size = le16_to_cpu(info->in_buf_size);
 
 err:
 	mutex_unlock(&usb_spi->usb_mutex);
