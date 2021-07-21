@@ -76,11 +76,11 @@ typedef struct usb_spi_ConnectedSlaveInfoLinux {
 } usb_spi_ConnectedSlaveInfoLinux;
 
 typedef struct usb_spi_Event {
-  usb_spi_EventType event_type;
   /**
-   * For types like Interrupt, this conveys which device is interrupting
+   * For event types like Interrupt, this conveys which device is interrupting
    */
   uint16_t data;
+  usb_spi_EventType event_type;
 } usb_spi_Event;
 
 /**

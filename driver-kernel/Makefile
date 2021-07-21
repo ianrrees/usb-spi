@@ -40,3 +40,7 @@ load:
 .PHONY: unload
 unload:
 	sudo rmmod $(MODNAME)
+
+.PHONY: reload
+reload:
+	sudo rmmod $(MODNAME); sudo insmod $(MODNAME).ko

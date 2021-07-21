@@ -81,10 +81,11 @@ impl ConnectedSlaveInfoLinux {
     pub fn encode(&self, buf: &mut [u8]) -> usize {
         buf[0] = self.has_interrupt;
         buf[1..33].copy_from_slice(&self.modalias);
-        82
+        33
     }
 }
 
+#[derive(Copy, Clone, Debug, N)]
 #[repr(u8)]
 pub enum EventType {
     NoEvent,
@@ -93,9 +94,17 @@ pub enum EventType {
 
 #[repr(C)]
 pub struct Event {
-    pub event_type: EventType,
-    /// For types like Interrupt, this conveys which device is interrupting
+    /// For event types like Interrupt, this conveys which device is interrupting
     pub data: u16,
+    pub event_type: EventType,
+}
+
+impl Event {
+    pub fn encode(&self, buf: &mut [u8]) -> usize {
+        buf[0..2].copy_from_slice(&self.data.to_le_bytes());
+        buf[2] = self.event_type as u8;
+        4 // Needs to be == sizeof(struct usb_spi_Event) in C
+    }
 }
 
 /// Used as the request field of IN control transfers

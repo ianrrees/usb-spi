@@ -3,10 +3,11 @@
 // Provides a SPI “Controller Driver” for an attached USB device
 
 #include <linux/kernel.h>
-#include <linux/slab.h>
 #include <linux/module.h>
-#include <linux/usb.h>
+#include <linux/slab.h>
 #include <linux/spi/spi.h>
+#include <linux/usb.h>
+#include <linux/workqueue.h>
 
 // Generated from a Rust package
 #include "../protocol/usb-spi-protocol.h"
@@ -35,6 +36,11 @@ struct usb_spi_device {
 	unsigned hardware_buf_size;
 	unsigned usb_buf_sz;
 	void *usb_buffer; // Protected by usb_mutex
+
+	/// Worker checking for events (namely interrupts) from the device
+	struct work_struct event_work;
+	/// Microseconds between polls for events from the device
+	int poll_interval;
 };
 
 // TODO this is bound to exist somewhere else...
@@ -288,6 +294,58 @@ err:
 	return ret;
 }
 
+static void usb_spi_check_events(struct work_struct *work)
+{
+	struct usb_spi_device *usb_spi = container_of(work, struct usb_spi_device, event_work);
+	int ret = 0;
+
+loop:
+	mutex_lock(&usb_spi->usb_mutex);
+
+	ret = usb_spi_control_in(usb_spi, usb_spi_ControlIn_GetEvent, 0, usb_spi->usb_buffer, sizeof(struct usb_spi_Event));
+	if (ret == -ENODEV) {
+		return; // Plug got yanked
+
+	} if (ret < 0) {
+		mutex_unlock(&usb_spi->usb_mutex);
+		dev_err(&usb_spi->usb_dev->dev, "Control IN GetEvent failed %d: %s", ret, error_to_string(ret));
+
+	} else if (ret != sizeof(struct usb_spi_Event)) {
+		mutex_unlock(&usb_spi->usb_mutex);
+		dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to GetEvent", ret);
+
+	} else {
+		const struct usb_spi_Event *received = (const struct usb_spi_Event *)usb_spi->usb_buffer;
+		struct usb_spi_Event event = {
+			.data = le16_to_cpu(received->data),
+			.event_type = received->event_type,
+		};
+
+		mutex_unlock(&usb_spi->usb_mutex);
+
+		switch (event.event_type) {
+			case usb_spi_EventType_NoEvent:
+				dev_info(&usb_spi->usb_dev->dev, "No event");
+				goto no_event;
+
+			case usb_spi_EventType_Interrupt:
+				dev_info(&usb_spi->usb_dev->dev, "Got Interrupt on %d", event.data);
+				break;
+		}
+		
+		// If we're getting events, read them as fast as possible
+		goto loop;
+	}
+
+no_event:
+	if (usb_spi->poll_interval >= 0) {
+		usleep_range(usb_spi->poll_interval, usb_spi->poll_interval + 20);
+	}
+	if (usb_spi->poll_interval >= 0) {
+		goto loop;
+	}
+}
+
 /// Returns 0 on success, or negative error code
 static int usb_spi_get_master_info(struct usb_spi_device *usb_spi)
 {
@@ -473,6 +531,10 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		spi_new_device(spi_master, &board_info);
 	}
 
+	usb_spi->poll_interval = 5 * 1000 * 1000;
+	INIT_WORK(&usb_spi->event_work, usb_spi_check_events);
+	schedule_work(&usb_spi->event_work);
+
 	usb_set_intfdata(usb_if, usb_spi);
 
 	return ret;
@@ -495,6 +557,12 @@ err:
 static void usb_spi_disconnect(struct usb_interface *interface)
 {
 	struct usb_spi_device *usb_spi = usb_get_intfdata(interface);
+	int i = 0;
+
+	// Stop polling for events from the device
+	i = usb_spi->poll_interval;
+	usb_spi->poll_interval = -1;
+	usleep_range(i, i*2);
 
 	spi_unregister_master(usb_spi->spi_master);
 

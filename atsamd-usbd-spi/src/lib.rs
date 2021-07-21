@@ -76,6 +76,7 @@ pub type SpiDeviceList<'a> = [&'a mut dyn SpiDevice];
 // This needs to be at least as big as the USB bulk endpoint size
 type BufferSize = U256;
 
+// TODO add event queue
 /// TX and RX buffers used by the UsbSpi
 ///
 /// Due to the BBQueue API, combined with Rust's rules about structs that
@@ -676,7 +677,15 @@ where
                 });
             }
             Some(protocol::ControlIn::GetEvent) => {
-                unimplemented!();
+                defmt::info!("Responding to GetEvent");
+                let event = protocol::Event {
+                    event_type: protocol::EventType::NoEvent,
+                    data: 0,
+                };
+
+                xfer.accept(|buf| Ok(event.encode(buf))).unwrap_or_else(|_| {
+                    defmt::error!("USB-SPI Failed to accept REQUEST_IN_HW_INFO")
+                });
             }
             Some(protocol::ControlIn::LinuxSlaveInfo) => {
                 let i = usize::from(req.value);
