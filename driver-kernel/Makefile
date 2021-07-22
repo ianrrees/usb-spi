@@ -1,3 +1,11 @@
+# Makes a kernel driver for a USB-SPI device
+#
+# Requires that a VID, PID, and Interface number are specified for the device
+# that the driver should attach to.  Setting DEBUG=1 will result in more logging
+# via `dmesg` or similar.
+#
+# Example invocation:
+# make VID=0x1234 PID=0x5678 INTERFACE=0
 
 MODNAME := usb_spi
 
@@ -14,6 +22,10 @@ endif
 
 obj-m := $(MODNAME).o
 ccflags-y := -DDEV_VID=$(VID) -DDEV_PID=$(PID) -DDEV_INTERFACE=$(INTERFACE)
+
+ifneq (x,x$(DEBUG))
+  ccflags-y += -DDEBUG
+endif
 
 ifneq ($(words $(PWD)),1)
   $(error "Kernel makefiles won't work with spaces in the path")

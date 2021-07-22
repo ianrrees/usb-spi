@@ -3,8 +3,16 @@
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/spi/spi.h>
+#include <linux/interrupt.h>
 
 #define BUF_SIZE 10
+
+static irqreturn_t test_driver_irq(int irq, void *ptr)
+{
+	dev_info(&((const struct spi_device *)(ptr))->dev, "In test_driver_irq() for IRQ %d!", irq);
+
+	return IRQ_HANDLED;
+}
 
 static int test_driver_probe(struct spi_device *dev)
 {
@@ -17,6 +25,15 @@ static int test_driver_probe(struct spi_device *dev)
 	memset(buf, 0xFF, BUF_SIZE);
 
 	dev_info(&dev->dev, "Test driver probed, IRQ: %d", dev->irq);
+
+	if (dev->irq >= 0) {
+		// TODO try without IRQF_TRIGGER_RISING
+		ret = request_irq(dev->irq, test_driver_irq, IRQF_SHARED | IRQF_TRIGGER_RISING, "test driver", dev);
+		if (ret < 0) {
+			dev_err(&dev->dev, "Failed to register IRQ handler, ret: %d", ret);
+			goto err;
+		}
+	}
 
 	if (ret >= 0) {
 		ret = spi_write(dev, "\xA0", 1);
@@ -45,13 +62,20 @@ static int test_driver_probe(struct spi_device *dev)
 
 	dev_info(&dev->dev, "Test transfers done, return code %d", ret);
 
-	kfree(buf);
+err:
+	if (buf) {
+		kfree(buf);
+	}
 	
     return 0;
 }
 
-int test_driver_remove(struct spi_device *device)
+int test_driver_remove(struct spi_device *dev)
 {
+	if (dev->irq >= 0) {
+		free_irq(dev->irq, dev);
+	}
+	dev_info(&dev->dev, "Removing test driver, had IRQ %d", dev->irq);
     return 0;
 }
 

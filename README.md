@@ -6,7 +6,6 @@ The idea is for this to become a firmware, protocol, and Linux kernel driver tha
 
 TODO
 ---
-* Interrupt support
+* Add example files
 * Reset line support
-* Add support for changing speed
-* Dynamically register drivers using modalias etc
+* Add support for changing speed, SPI mode, etc

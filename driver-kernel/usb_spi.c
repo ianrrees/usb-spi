@@ -3,6 +3,9 @@
 // Provides a SPI “Controller Driver” for an attached USB device
 
 #include <linux/kernel.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdomain.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
@@ -14,23 +17,25 @@
 
 #define USB_TIMEOUT_MS 1000
 
-// struct usb_spi_connected_peripheral {
-// 	// May not be necessary to store this?
-// 	char modalias[SPI_NAME_SIZE];
-// 	// during probe, bool whether the hardware provides an IRQ. Then the IRQ
-// 	int irq;
-// 	// TODO platform data
-// };
+// TODO add max SPI speed, mode, etc (reset state?) and check
+// against them in usb_spi_transfer_one_message()
+struct usb_spi_connected_chip {
+	int virq;
+	bool irq_mask;
+};
 
 struct usb_spi_device {
 	struct usb_device *usb_dev;
 	struct spi_master *spi_master;
+
+	struct usb_spi_connected_chip *connected_chips;
+	u16 connected_chip_count;
+	/// -1 initially, then the index of the selected device
+	int selected_chip;
+
 	// struct usb_spi_connected_peripheral *connected;
 	struct mutex usb_mutex;
 	u16 usb_interface_index;
-	u16 connected_count;
-	/// -1 initially, then the index of the selected device
-	int selected_chip;
 	unsigned int bulk_out_pipe;
 	unsigned int bulk_in_pipe;
 	unsigned hardware_buf_size;
@@ -38,9 +43,12 @@ struct usb_spi_device {
 	void *usb_buffer; // Protected by usb_mutex
 
 	/// Worker checking for events (namely interrupts) from the device
-	struct work_struct event_work;
+	struct work_struct poll_work;
 	/// Microseconds between polls for events from the device
 	int poll_interval;
+
+	struct irq_domain *irq_domain;
+	struct mutex irq_mutex;
 };
 
 // TODO this is bound to exist somewhere else...
@@ -217,10 +225,10 @@ static int usb_spi_chip_select(struct usb_spi_device *usb_spi, int chip_select) 
 	if (chip_select < 0) {
 		header->direction = usb_spi_Direction_CsDeassert;
 
-	} else if (chip_select >= usb_spi->connected_count) {
+	} else if (chip_select >= usb_spi->connected_chip_count) {
 		dev_err(&usb_spi->usb_dev->dev,
 		        "Chip select %d is out of range [0, %d)",
-		        chip_select, usb_spi->connected_count);
+		        chip_select, usb_spi->connected_chip_count);
 		ret = -EINVAL;
 		goto err;
 
@@ -263,7 +271,7 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 	list_for_each_entry(xfer, &mesg->transfers, transfer_list) {
 		int transferred = 0;
 
-		dev_info(&usb_spi->usb_dev->dev, "SPI transfer: %s%s, %dB, Speed:%d",
+		dev_dbg(&usb_spi->usb_dev->dev, "SPI transfer: %s%s, %dB, Speed:%d",
 		         xfer->tx_buf?"Tx":"", xfer->rx_buf?"Rx":"", xfer->len, xfer->speed_hz);
 		if (xfer->bits_per_word != 8) {
 			dev_warn(&usb_spi->usb_dev->dev,
@@ -294,9 +302,9 @@ err:
 	return ret;
 }
 
-static void usb_spi_check_events(struct work_struct *work)
+static void usb_spi_poll_events(struct work_struct *work)
 {
-	struct usb_spi_device *usb_spi = container_of(work, struct usb_spi_device, event_work);
+	struct usb_spi_device *usb_spi = container_of(work, struct usb_spi_device, poll_work);
 	int ret = 0;
 
 loop:
@@ -325,12 +333,26 @@ loop:
 
 		switch (event.event_type) {
 			case usb_spi_EventType_NoEvent:
-				dev_info(&usb_spi->usb_dev->dev, "No event");
+				dev_dbg(&usb_spi->usb_dev->dev, "Got NoEvent");
 				goto no_event;
 
-			case usb_spi_EventType_Interrupt:
-				dev_info(&usb_spi->usb_dev->dev, "Got Interrupt on %d", event.data);
+			case usb_spi_EventType_Interrupt: {
+				size_t chip_id = event.data;
+				if (chip_id < usb_spi->connected_chip_count) {
+					dev_dbg(&usb_spi->usb_dev->dev, "Hardware IRQ %ld", chip_id);
+
+					if (usb_spi->connected_chips[chip_id].irq_mask) {
+						unsigned long flags = 0;
+						local_irq_save(flags);
+						generic_handle_irq(usb_spi->connected_chips[chip_id].virq);
+						local_irq_restore(flags);
+					}
+				} else {
+					dev_err(&usb_spi->usb_dev->dev,
+					        "Got interrupt message for invalid chip ID %ld", chip_id);
+				}
 				break;
+			}
 		}
 		
 		// If we're getting events, read them as fast as possible
@@ -373,13 +395,81 @@ static int usb_spi_get_master_info(struct usb_spi_device *usb_spi)
 	}
 
 	usb_spi->selected_chip = -1;
-	usb_spi->connected_count = le16_to_cpu(info->slave_count);
+	usb_spi->connected_chip_count = le16_to_cpu(info->slave_count);
 	usb_spi->hardware_buf_size = le16_to_cpu(info->in_buf_size);
 
 err:
 	mutex_unlock(&usb_spi->usb_mutex);
 	return ret;
 }
+
+static void usb_spi_irq_mask(struct irq_data *data)
+{
+	struct usb_spi_device *usb_spi = irq_data_get_irq_chip_data(data);
+
+	size_t hwirq = data->hwirq;
+	if (hwirq < usb_spi->connected_chip_count) {
+		dev_dbg(&usb_spi->usb_dev->dev, "Masking hardware IRQ %lu", hwirq);
+		usb_spi->connected_chips[hwirq].irq_mask = true;
+	} else {
+		dev_err(&usb_spi->usb_dev->dev,
+		        "Request to mask out-of-range hardware IRQ %lu", hwirq);
+	}
+}
+
+static void usb_spi_irq_unmask(struct irq_data *data)
+{
+	struct usb_spi_device *usb_spi = irq_data_get_irq_chip_data(data);
+
+	size_t hwirq = data->hwirq;
+	if (hwirq < usb_spi->connected_chip_count) {
+		dev_dbg(&usb_spi->usb_dev->dev, "Unmasking hardware IRQ %lu", hwirq);
+		usb_spi->connected_chips[hwirq].irq_mask = false;
+	} else {
+		dev_err(&usb_spi->usb_dev->dev,
+		        "Request to unmask out-of-range hardware IRQ %lu", hwirq);
+	}
+}
+
+static int usb_spi_irq_set_type(struct irq_data *data, unsigned int type)
+{
+	return 0;
+}
+
+static void usb_spi_irq_bus_lock(struct irq_data *data)
+{
+	struct usb_spi_device *usb_spi = irq_data_get_irq_chip_data(data);
+	mutex_lock(&usb_spi->irq_mutex);
+}
+
+static void usb_spi_irq_bus_unlock(struct irq_data *data)
+{
+	struct usb_spi_device *usb_spi = irq_data_get_irq_chip_data(data);
+	mutex_unlock(&usb_spi->irq_mutex);
+}
+
+static struct irq_chip usb_spi_irq_chip = {
+	.name                = "usb-spi-irqs",
+	.irq_mask            = usb_spi_irq_mask,
+	.irq_unmask          = usb_spi_irq_unmask,
+	.irq_set_type        = usb_spi_irq_set_type,
+	.irq_bus_lock        = usb_spi_irq_bus_lock,
+	.irq_bus_sync_unlock = usb_spi_irq_bus_unlock,
+};
+
+/// Can we make a 5-TLD fn?
+static int usb_spi_irq_map(struct irq_domain *domain, unsigned int virq, irq_hw_number_t hwirq)
+{
+	irq_set_chip_data(virq, domain->host_data);
+	irq_set_chip(virq, &usb_spi_irq_chip);
+	irq_set_chip_and_handler(virq, &usb_spi_irq_chip, handle_simple_irq);
+	irq_set_noprobe(virq);
+	return 0;
+}
+
+static const struct irq_domain_ops usb_spi_irq_domain_ops = {
+	.map = usb_spi_irq_map,
+};
 
 static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_id *id)
 {
@@ -458,6 +548,36 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		goto err;
 	}
 
+	/// The spi_board_info needs IRQ, so set those up before SPI
+
+	mutex_init(&usb_spi->irq_mutex);
+
+	usb_spi->connected_chips = kzalloc(
+		usb_spi->connected_chip_count * sizeof(struct usb_spi_connected_chip),
+		GFP_KERNEL);
+	if (!usb_spi->connected_chips) {
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	usb_spi->irq_domain = irq_domain_add_linear(
+		usb_dev->dev.of_node, usb_spi->connected_chip_count,
+		&usb_spi_irq_domain_ops, usb_spi
+	);
+	if (usb_spi->irq_domain) {
+		for (i = 0; i < usb_spi->connected_chip_count; ++i) {
+			usb_spi->connected_chips[i].virq = irq_create_mapping(usb_spi->irq_domain, i);
+			dev_dbg(&usb_dev->dev, "USB-SPI mapping hardware IRQ %d to virtual IRQ %d",
+			        i, usb_spi->connected_chips[i].virq);
+		}
+	} else {
+		dev_err(&usb_dev->dev, "Failed to register IRQ domain");
+		ret = -ENODEV;
+		goto err;
+	}
+
+	/// SPI setup starts here; move to another function?
+
 	spi_master = spi_alloc_master(&usb_dev->dev, sizeof(usb_spi));
 	if (!spi_master) {
 		ret = -ENOMEM;
@@ -471,7 +591,7 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 	spi_master->max_speed_hz = 1000;
 
 	spi_master->bus_num = -1; // Kernel should allocate our bus_num
-	spi_master->num_chipselect = usb_spi->connected_count;
+	spi_master->num_chipselect = usb_spi->connected_chip_count;
 	spi_master->mode_bits = SPI_MODE_0 | SPI_MODE_1 | SPI_MODE_2 | SPI_MODE_3;
 
 	spi_master->flags = 0;
@@ -491,13 +611,9 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 	dev_info(&usb_dev->dev, "USB-SPI device %s %s %s providing SPI %d",
 	         usb_dev->manufacturer, usb_dev->product, usb_dev->serial, spi_master->bus_num);
 
-	// TODO this needs to be in a separate method
-	for (i = 0; i < usb_spi->connected_count; ++i) {
+	// TODO this needs to be in a separate method - maybe for all the SPI setup?
+	for (i = 0; i < usb_spi->connected_chip_count; ++i) {
 		struct spi_board_info board_info = {0};
-
-		// Slight chicken-and-egg problem here: we need to read in devices to
-		// determine if they provide IRQs, so we don't know how many IRQs to
-		// allocate.  Add an irq_count field, then fetch each?
 
 		// TODO this pattern needs to check the size of the usb_buffer
 		struct usb_spi_ConnectedSlaveInfoLinux *slave_info = usb_spi->usb_buffer;
@@ -522,18 +638,19 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 			dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d", slave_info->modalias, i);
 		}
 
-		strncpy(board_info.modalias, slave_info->modalias, sizeof(board_info.modalias));
 		board_info.bus_num = spi_master->bus_num;
 		board_info.chip_select = i;
+		board_info.irq = usb_spi->connected_chips[i].virq;
+		strncpy(board_info.modalias, slave_info->modalias, sizeof(board_info.modalias));
 
 		mutex_unlock(&usb_spi->usb_mutex);
 
 		spi_new_device(spi_master, &board_info);
 	}
 
-	usb_spi->poll_interval = 5 * 1000 * 1000;
-	INIT_WORK(&usb_spi->event_work, usb_spi_check_events);
-	schedule_work(&usb_spi->event_work);
+	usb_spi->poll_interval = 2 * 1000 * 1000; // TODO turn this to a more reasonable value
+	INIT_WORK(&usb_spi->poll_work, usb_spi_poll_events);
+	schedule_work(&usb_spi->poll_work);
 
 	usb_set_intfdata(usb_if, usb_spi);
 
@@ -543,7 +660,20 @@ err:
 	if (spi_master) {
 		spi_unregister_master(spi_master);
 	}
+
 	if (usb_spi) {
+		if (usb_spi->irq_domain) {
+			if (usb_spi->connected_chips) {
+				size_t i = 0;
+				for (i=0; i < usb_spi->connected_chip_count; ++i) {
+					irq_dispose_mapping(usb_spi->connected_chips[i].virq);
+				}
+			}
+			irq_domain_remove(usb_spi->irq_domain);
+		}
+		if (usb_spi->connected_chips) {
+			kfree(usb_spi->connected_chips);
+		}
 		usb_put_dev(usb_spi->usb_dev);
 		if (usb_spi->usb_buffer) {
 			kfree(usb_spi->usb_buffer);
@@ -564,7 +694,15 @@ static void usb_spi_disconnect(struct usb_interface *interface)
 	usb_spi->poll_interval = -1;
 	usleep_range(i, i*2);
 
+	// Tear down SPI before IRQ, so drivers can free their allocated interrupts
 	spi_unregister_master(usb_spi->spi_master);
+
+	for (i=0; i < usb_spi->connected_chip_count; ++i) {
+		irq_dispose_mapping(usb_spi->connected_chips[i].virq);
+	}
+	irq_domain_remove(usb_spi->irq_domain);
+
+	kfree(usb_spi->connected_chips);
 
 	dev_info(&usb_spi->usb_dev->dev, "USB-SPI disconnected");
 

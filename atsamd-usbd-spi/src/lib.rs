@@ -20,12 +20,14 @@ use typenum::marker_traits::Unsigned; // Also get rid of this dependency
 // See note in Cargo.toml as to why this not heapless
 use bbqueue::{BBBuffer, Consumer, Error as BBError, GrantR, GrantW, Producer};
 use cortex_m::interrupt;
-use usb_device::{class_prelude::*, Result};
-use usb_spi_protocol as protocol;
+use heapless::spsc::Queue;
 use protocol::{
     Direction,
+    Event,
     TransferHeader,
 };
+use usb_device::{class_prelude::*, Result};
+use usb_spi_protocol as protocol;
 
 const USB_CLASS_VENDOR_SPECIFIC: u8 = 0xFF; // TODO push up to a protocol crate
 const USB_SUBCLASS_VENDOR_SPECIFIC_USB_SPI: u8 = 0x02; // TODO push up to a protocol crate
@@ -151,6 +153,17 @@ impl TransactionState {
     }
 }
 
+/// Queue for events - mainly interrupts from attached chips
+///
+/// This should be sized such that all attached IRQs can fire simultaneously.
+/// The USB interface moves one event at a time as a control-IN transfer, so
+/// this is not a good design if very frequent interrupting is expected.  The
+/// host driver decides how frequently to poll, and could vary that interval.
+///
+/// Down the track, a header could be used for the bulk IN transfers, to send
+/// events with a higher bandwidth and probably lower latency.
+pub type EventQueue = Queue<Event, 16>; // stores N-1=15 elements
+
 // TODO add enable+disable methods and events for the attached devices.  Our driver could then
 // register/deregister the drivers for those devices, and our user could activate/deactivate
 // based on the hardware reset signal.
@@ -188,8 +201,11 @@ where
 
     devices: [&'a mut dyn SpiDevice; DEVICE_COUNT],
 
-    // Index in to Self.devices, of the currently-selected device
+    /// Index in to Self.devices of the currently-selected device
     selected_device: Option<usize>,
+
+    /// Queue of interrupt or similar events waiting for the host to fetch
+    event_queue: EventQueue,
 }
 
 impl<'a, B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize> UsbSpi<'a, B, P, DEVICE_COUNT, ENDPOINT_SIZE>
@@ -236,6 +252,25 @@ where
             spi,
             devices,
             selected_device: None,
+
+            event_queue: EventQueue::new(),
+        }
+    }
+
+    /// Call when a particular device interrupts
+    // TODO make this a method on BaiscSpiDevice; it'll need a reference to the event_queue producer
+    pub fn interrupt(&mut self, device_id: u16) {
+        if (device_id as usize) < DEVICE_COUNT {
+            self.event_queue.enqueue(
+                Event {
+                    event_type: protocol::EventType::Interrupt,
+                    data: device_id,
+                }
+            ).unwrap_or_else(|_| {
+                defmt::error!("Failed to enqueue interrupt for device {:?}", device_id);
+            })
+        } else {
+            defmt::error!("UsbSpi::interrupt() called with device_id higher than allowed");
         }
     }
 
@@ -677,11 +712,11 @@ where
                 });
             }
             Some(protocol::ControlIn::GetEvent) => {
-                defmt::info!("Responding to GetEvent");
-                let event = protocol::Event {
-                    event_type: protocol::EventType::NoEvent,
-                    data: 0,
-                };
+                let event = self.event_queue.dequeue().unwrap_or(
+                    Event {
+                        event_type: protocol::EventType::NoEvent,
+                        data: 0,
+                    });
 
                 xfer.accept(|buf| Ok(event.encode(buf))).unwrap_or_else(|_| {
                     defmt::error!("USB-SPI Failed to accept REQUEST_IN_HW_INFO")
