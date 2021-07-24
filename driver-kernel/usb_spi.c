@@ -339,9 +339,10 @@ loop:
 			case usb_spi_EventType_Interrupt: {
 				size_t chip_id = event.data;
 				if (chip_id < usb_spi->connected_chip_count) {
-					dev_dbg(&usb_spi->usb_dev->dev, "Hardware IRQ %ld", chip_id);
+					dev_dbg(&usb_spi->usb_dev->dev, "Hardware IRQ %ld, mask:%d",
+					        chip_id, usb_spi->connected_chips[chip_id].irq_mask);
 
-					if (usb_spi->connected_chips[chip_id].irq_mask) {
+					if (!usb_spi->connected_chips[chip_id].irq_mask) {
 						unsigned long flags = 0;
 						local_irq_save(flags);
 						generic_handle_irq(usb_spi->connected_chips[chip_id].virq);
