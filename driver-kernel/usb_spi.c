@@ -552,8 +552,9 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 
 	mutex_init(&usb_spi->irq_mutex);
 
-	usb_spi->connected_chips = kzalloc(
-		usb_spi->connected_chip_count * sizeof(struct usb_spi_connected_chip),
+	usb_spi->connected_chips = kcalloc(
+		usb_spi->connected_chip_count,
+		sizeof(struct usb_spi_connected_chip),
 		GFP_KERNEL);
 	if (!usb_spi->connected_chips) {
 		ret = -ENOMEM;
@@ -632,11 +633,7 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 			ret = 0;
 		}
 
-		if (slave_info->has_interrupt) {
-			dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d, has interrupt", slave_info->modalias, i);
-		} else {
-			dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d", slave_info->modalias, i);
-		}
+		dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d", slave_info->modalias, i);
 
 		board_info.bus_num = spi_master->bus_num;
 		board_info.chip_select = i;
@@ -648,7 +645,7 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		spi_new_device(spi_master, &board_info);
 	}
 
-	usb_spi->poll_interval = 2 * 1000 * 1000; // TODO turn this to a more reasonable value
+	usb_spi->poll_interval = 100 * 1000; // microseconds
 	INIT_WORK(&usb_spi->poll_work, usb_spi_poll_events);
 	schedule_work(&usb_spi->poll_work);
 

@@ -726,7 +726,7 @@ where
                 let i = usize::from(req.value);
                 if i < self.devices.len() {
                     xfer.accept(|buf|
-                        Ok(protocol::ConnectedSlaveInfoLinux::new(false, self.devices[i].modalias()).encode(buf))
+                        Ok(protocol::ConnectedSlaveInfoLinux::new(self.devices[i].modalias()).encode(buf))
                     ).unwrap_or_else(|_| {
                         defmt::error!("USB-SPI Failed to accept REQUEST_IN_LINUX_SLAVE_INFO")
                     });

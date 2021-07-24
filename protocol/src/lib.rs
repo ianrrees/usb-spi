@@ -53,7 +53,6 @@ impl MasterInfo {
 pub struct ConnectedSlaveInfoLinux {
     // TODO
     // pub platform_data_len: u16,
-    pub has_interrupt: u8, // TODO bitfield
     /// NULL-terminated, 32 comes from Linux's SPI_NAME_SIZE TODO use const
     pub modalias: [u8; 32],
     // TODO how to encode this in Rust?
@@ -63,7 +62,7 @@ pub struct ConnectedSlaveInfoLinux {
 }
 
 impl ConnectedSlaveInfoLinux {
-    pub fn new(has_interrupt: bool, modalias: &'static str) -> Self {
+    pub fn new(modalias: &'static str) -> Self {
         let mut modalias_arr = [0; 32];
         if modalias.len() < 32 {
             modalias_arr[0..modalias.len()].copy_from_slice(modalias.as_bytes());
@@ -73,15 +72,13 @@ impl ConnectedSlaveInfoLinux {
         }
 
         Self {
-            has_interrupt: has_interrupt as u8,
             modalias: modalias_arr,
         }
     }
 
     pub fn encode(&self, buf: &mut [u8]) -> usize {
-        buf[0] = self.has_interrupt;
-        buf[1..33].copy_from_slice(&self.modalias);
-        33
+        buf[0..32].copy_from_slice(&self.modalias);
+        32
     }
 }
 

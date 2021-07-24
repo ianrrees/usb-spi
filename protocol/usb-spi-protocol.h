@@ -68,7 +68,6 @@ typedef struct usb_spi_MasterInfo {
  * Returned by SPI masters for REQUEST_IN_LINUX_SLAVE_INFO
  */
 typedef struct usb_spi_ConnectedSlaveInfoLinux {
-  uint8_t has_interrupt;
   /**
    * NULL-terminated, 32 comes from Linux's SPI_NAME_SIZE TODO use const
    */
