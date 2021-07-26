@@ -24,9 +24,6 @@ defmt-rtt = "0.2.0"
 usb-device = "0.2.7"
 
 [dependencies.atsamd-hal]
-# TODO stop using this
-path = "/home/irees/Projects/20201112 - atsamd-rs/hal"
-
 # TODO specify as a minimum version of atsamd-hal once the UARTv2 PR is merged
 features = ["usb"]
 
