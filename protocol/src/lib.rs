@@ -133,8 +133,6 @@ pub enum Direction { // TODO rename
     OutOnly,
     InOnly,
     Both,
-    /// bytes field is chip select index
-    CsAssert,
     /// bytes field is ignored
     CsDeassert,
 }
@@ -142,19 +140,22 @@ pub enum Direction { // TODO rename
 /// Sent through the bulk OUT endpoint, possibly before any OUT data
 #[repr(C)]
 pub struct TransferHeader {
-    pub bytes: u16, // TODO rename 'data'
+    pub bytes: u16,
+    /// Index of the slave device the transfer is intended for
+    pub index: u16,
     pub direction: Direction,
 }
 
 impl TransferHeader {
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() <3 { // Not !=, because data often follows
+        if buf.len() < 5 { // Not !=, because data often follows
             None
         } else {
-            match Direction::n(buf[2]) {
+            match Direction::n(buf[4]) {
                 Some(direction) => {
                     Some(Self{
                         bytes: LittleEndian::read_u16(&buf[0..2]),
+                        index: LittleEndian::read_u16(&buf[2..4]),
                         direction,
                     })
                 }

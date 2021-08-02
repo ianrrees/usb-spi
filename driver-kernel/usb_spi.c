@@ -132,8 +132,12 @@ static void usb_spi_cleanup(struct spi_device *spi)
 
 /// Transfers data over the bulk endpoints
 /// Returns negative error code, or number of bytes transferred
-static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_transfer *xfer, unsigned offset)
-{
+static int usb_spi_transfer_chunk(
+	struct usb_spi_device *usb_spi,
+	struct spi_transfer *xfer,
+	int chip_index,
+	unsigned offset
+) {
 	int ret = 0;
 	int actual_len = 0;
 	unsigned out_len = 0;
@@ -143,6 +147,8 @@ static int usb_spi_transfer_chunk(struct usb_spi_device *usb_spi, struct spi_tra
 
 	struct usb_spi_TransferHeader *header = (struct usb_spi_TransferHeader *) usb_spi->usb_buffer;
 	memset(header, 0, sizeof(*header));
+
+	header->index = chip_index;
 
 	if (xfer->tx_buf) {
 		data_len = min(data_len, usb_spi->usb_buf_sz - (unsigned)sizeof(*header));
@@ -212,8 +218,7 @@ err:
 	return ret;
 }
 
-// Chip select -1 deasserts the CS, nonnegative asserts
-static int usb_spi_chip_select(struct usb_spi_device *usb_spi, int chip_select) {
+static int usb_spi_deassert_chip_select(struct usb_spi_device *usb_spi) {
 	int ret = 0;
 	int actual_len = 0;
 	int total_len = 0;
@@ -222,20 +227,7 @@ static int usb_spi_chip_select(struct usb_spi_device *usb_spi, int chip_select) 
 	struct usb_spi_TransferHeader *header = (struct usb_spi_TransferHeader *) usb_spi->usb_buffer;
 	memset(header, 0, sizeof(*header));
 
-	if (chip_select < 0) {
-		header->direction = usb_spi_Direction_CsDeassert;
-
-	} else if (chip_select >= usb_spi->connected_chip_count) {
-		dev_err(&usb_spi->usb_dev->dev,
-		        "Chip select %d is out of range [0, %d)",
-		        chip_select, usb_spi->connected_chip_count);
-		ret = -EINVAL;
-		goto err;
-
-	} else {
-		header->direction = usb_spi_Direction_CsAssert;
-		header->bytes = cpu_to_le16(chip_select);
-	}
+	header->direction = usb_spi_Direction_CsDeassert;
 
 	while (total_len < sizeof(*header)) {
 		ret = usb_bulk_msg(usb_spi->usb_dev,
@@ -260,11 +252,13 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 	struct usb_spi_device *usb_spi = spi_master_get_devdata(master);
 	struct spi_transfer *xfer = NULL;
 	int ret = 0;
+	int chip_index = mesg->spi->chip_select;
 
 	mutex_lock(&usb_spi->usb_mutex);
 
-	ret = usb_spi_chip_select(usb_spi, mesg->spi->chip_select);
-	if (ret < 0) {
+	if (chip_index < 0 || chip_index >= usb_spi->connected_chip_count) {
+		dev_warn(&usb_spi->usb_dev->dev, "SPI transfer attempted for out-of-range chip select %d", chip_index);
+		ret = -EINVAL;
 		goto err;
 	}
 
@@ -282,7 +276,7 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 	// TODO check SPI mode
 
 		while (transferred < xfer->len) {
-			ret = usb_spi_transfer_chunk(usb_spi, xfer, transferred);
+			ret = usb_spi_transfer_chunk(usb_spi, xfer, mesg->spi->chip_select, transferred);
 			if (ret < 0) {
 				goto err;
 			}
@@ -293,7 +287,7 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 		}
 	}
 
-	ret = usb_spi_chip_select(usb_spi, -1);
+	usb_spi_deassert_chip_select(usb_spi);
 
 err:
 	mutex_unlock(&usb_spi->usb_mutex);

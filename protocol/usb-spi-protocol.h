@@ -28,10 +28,6 @@ enum usb_spi_Direction {
   usb_spi_Direction_InOnly,
   usb_spi_Direction_Both,
   /**
-   * bytes field is chip select index
-   */
-  usb_spi_Direction_CsAssert,
-  /**
    * bytes field is ignored
    */
   usb_spi_Direction_CsDeassert,
@@ -87,5 +83,9 @@ typedef struct usb_spi_Event {
  */
 typedef struct usb_spi_TransferHeader {
   uint16_t bytes;
+  /**
+   * Index of the slave device the transfer is intended for
+   */
+  uint16_t index;
   usb_spi_Direction direction;
 } usb_spi_TransferHeader;

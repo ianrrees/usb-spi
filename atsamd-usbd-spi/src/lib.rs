@@ -332,7 +332,7 @@ where
 
         match state.direction {
             Direction::None => {}
-            Direction::CsAssert | Direction::CsDeassert => {
+            Direction::CsDeassert => {
                 defmt::error!("SPI-USB flush_usb() in unexpected state");
             }
             Direction::OutOnly => {
@@ -504,6 +504,19 @@ where
                     let received = count - header_len;
 
                     match direction {
+                        Direction::OutOnly | Direction::Both | Direction::InOnly => {
+                            let index = usize::from(header.index);
+                            if index < self.devices.len() {
+                                self.select(Some(index));
+                            } else {
+                                // TODO log error
+                                defmt::error!("Got an invalid slave ID {:?}", index);
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                    match direction {
                         Direction::OutOnly | Direction::Both =>  {
                             grant.buf()[..received].copy_from_slice(&buf[header_len..count]);
                             grant.commit(received);
@@ -534,16 +547,6 @@ where
                             defmt::error!("starting no transaction!?");
                             return;
                             // TODO
-                        }
-                        Direction::CsAssert => {
-                            let slave_index = usize::from(header.bytes);
-                            if slave_index < self.devices.len() {
-                                self.select(Some(slave_index));
-                            } else {
-                                // TODO log error
-                                defmt::error!("Got an invalid slave ID {:?}", slave_index);
-                            }
-                            return;
                         }
                         Direction::CsDeassert => {
                             self.select(None);
@@ -669,7 +672,7 @@ where
                     // Waiting for an InOnly transaction to finish
                 }
 
-                Direction::CsAssert | Direction::CsDeassert => {
+                Direction::CsDeassert => {
                     // TODO 
                     defmt::warn!("Ignoring USB OUT transfer when in an invalid state {:?}",
                                     self.transaction_state.direction as usize);
