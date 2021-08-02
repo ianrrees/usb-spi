@@ -128,13 +128,11 @@ pub enum ControlIn {
 /// change based on the SPI direction.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, N)]
 #[repr(u8)]
-pub enum Direction { // TODO rename
+pub enum Direction {
     None,
     OutOnly,
     InOnly,
     Both,
-    /// bytes field is ignored
-    CsDeassert,
 }
 
 /// Sent through the bulk OUT endpoint, possibly before any OUT data

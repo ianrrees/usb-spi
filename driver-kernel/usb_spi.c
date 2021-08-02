@@ -218,35 +218,6 @@ err:
 	return ret;
 }
 
-static int usb_spi_deassert_chip_select(struct usb_spi_device *usb_spi) {
-	int ret = 0;
-	int actual_len = 0;
-	int total_len = 0;
-
-	// Caller has locked usb_mutex
-	struct usb_spi_TransferHeader *header = (struct usb_spi_TransferHeader *) usb_spi->usb_buffer;
-	memset(header, 0, sizeof(*header));
-
-	header->direction = usb_spi_Direction_CsDeassert;
-
-	while (total_len < sizeof(*header)) {
-		ret = usb_bulk_msg(usb_spi->usb_dev,
-		                   usb_spi->bulk_out_pipe,
-		                   usb_spi->usb_buffer,
-		                   sizeof(*header),
-		                   &actual_len,
-		                   USB_TIMEOUT_MS);
-		total_len += actual_len;
-		if (ret < 0 && ret != -ETIMEDOUT) {
-			dev_err(&usb_spi->usb_dev->dev, "Error sending bulk OUT: %s (%d)", error_to_string(ret), ret);
-			goto err;
-		}
-	}
-
-err:
-	return ret;
-}
-
 static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_message *mesg)
 {
 	struct usb_spi_device *usb_spi = spi_master_get_devdata(master);
@@ -286,8 +257,6 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 			ret = 0;
 		}
 	}
-
-	usb_spi_deassert_chip_select(usb_spi);
 
 err:
 	mutex_unlock(&usb_spi->usb_mutex);

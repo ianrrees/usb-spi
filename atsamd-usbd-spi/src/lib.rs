@@ -274,10 +274,18 @@ where
         }
     }
 
+    fn maybe_done(&mut self) {
+        if self.transaction_state.from_spi >= self.transaction_state.expected {
+            if self.transaction_state.from_spi > self.transaction_state.expected {
+                defmt::error!("Received more than expected from SPI");
+            }
+            self.select(None);
+            self.transaction_state.reset();
+        }
+    }
+
     /// Helper for flush_usb() when in state InOnly Both transaction states
     fn write_usb_in(&mut self, grant: GrantR<BufferSize>) {
-        let state = &mut self.transaction_state;
-
         let full_packet_count = match self.write_state {
             WriteState::Full(c) => c,
             WriteState::NotFull => 0,
@@ -301,15 +309,9 @@ where
                 // the endpoint_in_complete() callback, so we're sure
                 // the data was read by the host.
                 grant.release(count);
-                state.from_spi += count;
+                self.transaction_state.from_spi += count;
 
-                if state.from_spi > state.expected {
-                    defmt::error!("Received more than expected from SPI InOnly|Both!");
-                    state.reset();
-                } else if state.from_spi == state.expected {
-                    // Normal end of a transaction
-                    state.reset();
-                }
+                self.maybe_done();
 
                 self.write_state = if count >= ENDPOINT_SIZE {
                     WriteState::Full(full_packet_count + 1)
@@ -328,35 +330,24 @@ where
 
     // TODO perhaps a better name; also used in transactions that don't send USB
     pub fn flush_usb(&mut self) {
-        let state = &mut self.transaction_state;
-
-        match state.direction {
+        match self.transaction_state.direction {
             Direction::None => {}
-            Direction::CsDeassert => {
-                defmt::error!("SPI-USB flush_usb() in unexpected state");
-            }
             Direction::OutOnly => {
                 // Host isn't intersted in SPI reads
                 match self.spi_to_usb_consumer.read() {
                     Ok(grant) => {
                         let len = grant.buf().len();
-                        state.from_spi += len;
+                        self.transaction_state.from_spi += len;
                         grant.release(len);
 
-                        if state.from_spi > state.expected {
-                            defmt::error!("Received more than expected from SPI OutOnly!");
-                            state.reset();
-                        } else if state.from_spi == state.expected {
-                            // Normal end of a transaction
-                            state.reset();
-                        }
+                        self.maybe_done();
                     }
                     _ => {}
                 }
             }
             Direction::InOnly | Direction::Both => {
-                if state.direction == Direction::InOnly && state.expected < state.from_usb {
-                    let remaining = state.expected - state.from_usb;
+                if self.transaction_state.direction == Direction::InOnly && self.transaction_state.expected < self.transaction_state.from_usb {
+                    let remaining = self.transaction_state.expected - self.transaction_state.from_usb;
                     if let Ok(mut grant) = self.usb_to_spi_producer.grant_max_remaining(remaining) {
                         let generated = grant.buf().len();
 
@@ -365,7 +356,7 @@ where
                         }
 
                         grant.commit(generated);
-                        state.from_usb += generated;
+                        self.transaction_state.from_usb += generated;
                         self.spi.enable_interrupts(Flags::DRE);
                     }
                 }
@@ -475,7 +466,7 @@ where
         }
     }
 
-    pub fn select(&mut self, device_index: Option<usize>) {
+    fn select(&mut self, device_index: Option<usize>) {
         interrupt::free(|_| { // TODO implement the minimum level scheme instead
             if device_index != self.selected_device {
                 if let Some(index) = self.selected_device {
@@ -547,10 +538,6 @@ where
                             defmt::error!("starting no transaction!?");
                             return;
                             // TODO
-                        }
-                        Direction::CsDeassert => {
-                            self.select(None);
-                            return;
                         }
                     }
                 } else {
@@ -646,6 +633,7 @@ where
         }
 
         self.write_state = WriteState::NotFull;
+        self.select(None);
         self.transaction_state.reset();
     }
 
@@ -670,12 +658,6 @@ where
 
                 Direction::InOnly => {
                     // Waiting for an InOnly transaction to finish
-                }
-
-                Direction::CsDeassert => {
-                    // TODO 
-                    defmt::warn!("Ignoring USB OUT transfer when in an invalid state {:?}",
-                                    self.transaction_state.direction as usize);
                 }
             }
         }

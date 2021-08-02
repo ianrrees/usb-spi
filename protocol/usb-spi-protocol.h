@@ -27,10 +27,6 @@ enum usb_spi_Direction {
   usb_spi_Direction_OutOnly,
   usb_spi_Direction_InOnly,
   usb_spi_Direction_Both,
-  /**
-   * bytes field is ignored
-   */
-  usb_spi_Direction_CsDeassert,
 };
 typedef uint8_t usb_spi_Direction;
 
