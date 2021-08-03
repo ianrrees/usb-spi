@@ -33,6 +33,7 @@ typedef uint8_t usb_spi_Direction;
 enum usb_spi_EventType {
   usb_spi_EventType_NoEvent,
   usb_spi_EventType_Interrupt,
+  usb_spi_EventType_Error,
 };
 typedef uint8_t usb_spi_EventType;
 
@@ -68,7 +69,10 @@ typedef struct usb_spi_ConnectedSlaveInfoLinux {
 
 typedef struct usb_spi_Event {
   /**
-   * For event types like Interrupt, this conveys which device is interrupting
+   * Some events contain more information, it goes here
+   *
+   * Interrupt: which device index is interrupting
+   * Error: enum value of the specific error
    */
   uint16_t data;
   usb_spi_EventType event_type;

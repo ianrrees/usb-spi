@@ -1,15 +1,7 @@
 #![no_std]
 
 /// Protocol used between the USB host and device, for USB-SPI
-
-// Thinking: Use control requests to pick the slave device (inc CS, bus clock, etc) and set whether
-// the bulk endpoints are used for reading/writing/both.  Reject requests when there's data waiting.
-//
-// Unsure if current Rust usb-device supports control requests with more data than the control EP
-// can handle in a single transaction?
-
-// TODO SPI mode
-
+use bitflags::bitflags;
 use byteorder::{ByteOrder, LittleEndian};
 use enumn::N;
 
@@ -37,7 +29,7 @@ impl MasterInfo {
             in_buf_size,
         }
     }
-    
+
     // TODO should just be able to memcpy all this, after checking that we're little-endian...
     pub fn encode(&self, buf: &mut [u8]) -> usize {
         buf[0] = self.hardware as u8;
@@ -45,6 +37,20 @@ impl MasterInfo {
         buf[2..4].copy_from_slice(&self.slave_count.to_le_bytes());
         buf[4..6].copy_from_slice(&self.in_buf_size.to_le_bytes());
         6 // Length
+    }
+}
+
+bitflags! {
+    pub struct SpiDeviceCapabilities: u8 {
+        const MODE_0 = 0x01;
+        const MODE_1 = 0x02;
+        const MODE_2 = 0x04;
+        const MODE_3 = 0x08;
+        const ANY_MODE = Self::MODE_0.bits | Self::MODE_1.bits | Self::MODE_2.bits | Self::MODE_3.bits;
+        const MSB_FIRST = 0x10;
+        const LSB_FIRST = 0x20;
+        const INTERRUPT = 0x40;
+        const RESET = 0x80;
     }
 }
 
@@ -58,7 +64,9 @@ pub struct ConnectedSlaveInfoLinux {
     // TODO how to encode this in Rust?
     // char platform_data[0],
 
-    // Is there any point in passing the mode or speed?
+    // pub max_clock_speed_hz: u32,
+
+    // pub capabilities: SpiDeviceCapabilities,
 }
 
 impl ConnectedSlaveInfoLinux {
@@ -82,16 +90,26 @@ impl ConnectedSlaveInfoLinux {
     }
 }
 
+#[repr(C)]
+pub enum Error {
+    IndexOutOfRange,
+    UnsupportedByDevice,
+}
+
 #[derive(Copy, Clone, Debug, N)]
 #[repr(u8)]
 pub enum EventType {
     NoEvent,
     Interrupt,
+    Error,
 }
 
 #[repr(C)]
 pub struct Event {
-    /// For event types like Interrupt, this conveys which device is interrupting
+    /// Some events contain more information, it goes here
+    ///
+    /// Interrupt: which device index is interrupting
+    /// Error: enum value of the specific error
     pub data: u16,
     pub event_type: EventType,
 }
@@ -146,20 +164,17 @@ pub struct TransferHeader {
 
 impl TransferHeader {
     pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < 5 { // Not !=, because data often follows
+        if buf.len() < 5 {
+            // Not !=, because data often follows
             None
         } else {
             match Direction::n(buf[4]) {
-                Some(direction) => {
-                    Some(Self{
-                        bytes: LittleEndian::read_u16(&buf[0..2]),
-                        index: LittleEndian::read_u16(&buf[2..4]),
-                        direction,
-                    })
-                }
-                None => {
-                    None
-                }
+                Some(direction) => Some(Self {
+                    bytes: LittleEndian::read_u16(&buf[0..2]),
+                    index: LittleEndian::read_u16(&buf[2..4]),
+                    direction,
+                }),
+                None => None,
             }
         }
     }

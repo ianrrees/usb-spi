@@ -5,11 +5,15 @@ extern crate defmt_rtt;
 
 use atsamd_hal::{
     gpio::v2::*,
-    hal::digital::v2::OutputPin, // embedded_hal trait
+    hal::{
+        // embedded_hal stuff
+        digital::v2::OutputPin,
+        spi::{self, Mode},
+    },
     prelude::*,
     sercom::v2::spi::{
-        Config, EightBit, Error as SpiError, Errors as SpiErrors, Flags, Master, Phase, Polarity,
-        Rx, Spi, Tx, ValidPads,
+        Config, EightBit, Error as SpiError, Errors as SpiErrors, Flags, Master, Rx, Spi, Tx,
+        ValidPads,
     },
     typelevel::NoneT,
 };
@@ -23,9 +27,13 @@ use bbqueue::{BBBuffer, Consumer, Error as BBError, GrantR, GrantW, Producer};
 use core::ptr::NonNull;
 use cortex_m::interrupt;
 use heapless::spsc;
+use protocol::Error;
+pub use protocol::SpiDeviceCapabilities;
 use protocol::{Direction, Event, TransferHeader};
-use usb_device::{class_prelude::*, Result};
+use usb_device::{class_prelude::*, Result as UsbResult};
 use usb_spi_protocol as protocol;
+
+type UsbSpiResult<T> = Result<T, Error>;
 
 const USB_CLASS_VENDOR_SPECIFIC: u8 = 0xFF; // TODO push up to a protocol crate
 const USB_SUBCLASS_VENDOR_SPECIFIC_USB_SPI: u8 = 0x02; // TODO push up to a protocol crate
@@ -48,16 +56,49 @@ pub trait SpiDevice {
 
     /// modalias is how Linux SPI drivers associate devices with controllers
     fn modalias(&self) -> &'static str;
+
+    /// Returns the maximum clock speed supported by the device, in Hz
+    fn max_clock_speed_hz(&self) -> u32;
+
+    /// Returns the capabilities bitmask associated with the device
+    fn capabilities(&self) -> SpiDeviceCapabilities;
 }
 
 // TODO add interrupt
-pub struct BasicSpiDevice<P: AnyPin<Mode = PushPullOutput>> {
-    pub modalias: Option<&'static str>,
-
-    pub cs_pin: P,
+// TODO change this to accept embedded_hal's output pin
+pub struct BasicSpiDevice<P>
+where
+    P: AnyPin<Mode = PushPullOutput>,
+{
+    cs_pin: P,
+    modalias: Option<&'static str>,
+    max_clock_speed_hz: u32,
+    capabilities: SpiDeviceCapabilities,
 }
 
-impl<P: AnyPin<Mode = PushPullOutput> + OutputPin> SpiDevice for BasicSpiDevice<P> {
+impl<P> BasicSpiDevice<P>
+where
+    P: AnyPin<Mode = PushPullOutput> + OutputPin,
+{
+    pub fn new(
+        cs_pin: impl Into<P>,
+        modalias: Option<&'static str>,
+        max_clock_speed_hz: u32,
+        capabilities: SpiDeviceCapabilities,
+    ) -> Self {
+        Self {
+            cs_pin: cs_pin.into(),
+            modalias,
+            max_clock_speed_hz,
+            capabilities,
+        }
+    }
+}
+
+impl<P> SpiDevice for BasicSpiDevice<P>
+where
+    P: AnyPin<Mode = PushPullOutput> + OutputPin,
+{
     fn select(&mut self) {
         self.cs_pin.set_low().ok().unwrap();
     }
@@ -68,6 +109,14 @@ impl<P: AnyPin<Mode = PushPullOutput> + OutputPin> SpiDevice for BasicSpiDevice<
 
     fn modalias(&self) -> &'static str {
         self.modalias.unwrap_or("")
+    }
+
+    fn max_clock_speed_hz(&self) -> u32 {
+        self.max_clock_speed_hz
+    }
+
+    fn capabilities(&self) -> SpiDeviceCapabilities {
+        self.capabilities
     }
 }
 
@@ -226,12 +275,8 @@ where
             device.deselect();
         }
 
-        let mut spi = spi_hardware
-            // TODO encode these in the device settings
-            .cpol(Polarity::IdleHigh)
-            .cpha(Phase::CaptureOnSecondTransition)
-            .baud(1000.khz())
-            .enable();
+        // The default mode/speed don't matter, they'll be set in select_device()
+        let mut spi = spi_hardware.enable();
 
         spi.enable_interrupts(Flags::RXC);
 
@@ -289,19 +334,84 @@ where
         )
     }
 
-    fn select(&mut self, device_index: Option<usize>) {
+    fn deselect_device(&mut self) {
         interrupt::free(|_| {
             // TODO implement the minimum level scheme instead
-            if device_index != self.selected_device {
-                if let Some(index) = self.selected_device {
-                    self.devices[index].deselect();
-                }
-                if let Some(index) = device_index {
-                    self.devices[index].select();
-                }
-                self.selected_device = device_index;
+            if let Some(index) = self.selected_device {
+                self.devices[index].deselect();
+                self.selected_device = None;
             }
         });
+    }
+
+    /// Asserts chip select for the specified device, and sets up SPI peripheral
+    fn select_device(
+        &mut self,
+        index: usize,
+        clock_speed: u32,
+        mode: Mode,
+        msb_first: bool,
+    ) -> UsbSpiResult<()> {
+        interrupt::free(|_| {
+            // TODO implement the minimum level scheme instead
+            if Some(index) != self.selected_device {
+                if let Some(old_index) = self.selected_device {
+                    self.devices[old_index].deselect();
+                }
+
+                let device = if index >= DEVICE_COUNT {
+                    self.event_queue
+                        .enqueue(Event {
+                            event_type: protocol::EventType::Error,
+                            data: Error::IndexOutOfRange as u16,
+                        })
+                        .unwrap_or_else(|_| {
+                            defmt::error!(
+                                "Failed to enqueue IndexOutOfRange error in select_device()"
+                            );
+                        });
+
+                    return Err(Error::IndexOutOfRange);
+                } else {
+                    &mut self.devices[index]
+                };
+
+                let capabilities = device.capabilities();
+
+                if clock_speed > device.max_clock_speed_hz()
+                    || match mode {
+                        spi::MODE_0 => (capabilities & SpiDeviceCapabilities::MODE_0).is_empty(),
+                        spi::MODE_1 => (capabilities & SpiDeviceCapabilities::MODE_1).is_empty(),
+                        spi::MODE_2 => (capabilities & SpiDeviceCapabilities::MODE_2).is_empty(),
+                        spi::MODE_3 => (capabilities & SpiDeviceCapabilities::MODE_3).is_empty(),
+                    }
+                    || msb_first && (capabilities & SpiDeviceCapabilities::MSB_FIRST).is_empty()
+                    || !msb_first && (capabilities & SpiDeviceCapabilities::LSB_FIRST).is_empty()
+                {
+                    self.event_queue
+                        .enqueue(Event {
+                            event_type: protocol::EventType::Error,
+                            data: Error::UnsupportedByDevice as u16,
+                        })
+                        .unwrap_or_else(|_| {
+                            defmt::error!(
+                                "Failed to enqueue UnsupportedByDevice error in select_device()"
+                            );
+                        });
+                    Err(Error::UnsupportedByDevice)
+                } else {
+                    self.spi.reconfigure(|c| {
+                        c.baud(clock_speed.hz()).spi_mode(mode).msb_first(msb_first)
+                    });
+
+                    device.select();
+                    self.selected_device = Some(index);
+                    Ok(())
+                }
+            } else {
+                Ok(()) // No change
+            }
+        })
     }
 }
 
@@ -311,9 +421,9 @@ where
     B: UsbBus,
     P: ValidPads<SS = NoneT> + Tx + Rx,
 {
-    fn select(&mut self, index: Option<usize>) {
-        // Safe because Static::select() does its work in an ISR free block
-        unsafe { self.statics.as_mut() }.select(index);
+    fn deselect_device(&mut self) {
+        // Safe because Static::deselect_device() does its work in an ISR free block
+        unsafe { self.statics.as_mut() }.deselect_device();
     }
 
     /// Triggers an SPI interrupt if SPI isn't already transferring data
@@ -329,7 +439,7 @@ where
             if self.transaction_state.from_spi > self.transaction_state.expected {
                 defmt::error!("Received more than expected from SPI");
             }
-            self.select(None);
+            self.deselect_device();
             self.transaction_state.reset();
         }
     }
@@ -465,11 +575,15 @@ where
                     match direction {
                         Direction::OutOnly | Direction::Both | Direction::InOnly => {
                             let index = usize::from(header.index);
-                            if index < DEVICE_COUNT {
-                                self.select(Some(index));
-                            } else {
-                                // TODO log error
-                                defmt::error!("Got an invalid slave ID {:?}", index);
+
+                            // Safe because Static::select_device() does its work in an ISR free block
+                            if let Err(_) = unsafe { self.statics.as_mut() }.select_device(
+                                index,
+                                1_000_000,
+                                spi::MODE_3,
+                                true,
+                            ) {
+                                // select_device() has enqueued the error message
                                 return;
                             }
                         }
@@ -558,7 +672,7 @@ where
     B: UsbBus,
     P: ValidPads<SS = NoneT> + Tx + Rx,
 {
-    fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> Result<()> {
+    fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> UsbResult<()> {
         writer.interface(
             self.usb_interface,
             USB_CLASS_VENDOR_SPECIFIC,
@@ -607,7 +721,7 @@ where
         // }
 
         self.write_state = WriteState::NotFull;
-        self.select(None);
+        self.deselect_device();
         self.transaction_state.reset();
     }
 
