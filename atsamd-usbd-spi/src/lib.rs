@@ -29,7 +29,7 @@ use cortex_m::interrupt;
 use heapless::spsc;
 use protocol::Error;
 pub use protocol::SpiDeviceCapabilities;
-use protocol::{Direction, Event, TransferHeader};
+use protocol::{Direction, Event, TransferHeader, TransferMode};
 use usb_device::{class_prelude::*, Result as UsbResult};
 use usb_spi_protocol as protocol;
 
@@ -579,8 +579,14 @@ where
                             // Safe because Static::select_device() does its work in an ISR free block
                             if let Err(_) = unsafe { self.statics.as_mut() }.select_device(
                                 index,
-                                1_000_000,
-                                spi::MODE_3,
+                                header.speed_hz,
+                                match TransferMode::from_bits_truncate(header.mode) & TransferMode::MODE_MASK {
+                                    TransferMode::MODE_0 => spi::MODE_0,
+                                    TransferMode::MODE_1 => spi::MODE_1,
+                                    TransferMode::MODE_2 => spi::MODE_2,
+                                    TransferMode::MODE_3 => spi::MODE_3,
+                                    _ => unreachable!(),
+                                },
                                 true,
                             ) {
                                 // select_device() has enqueued the error message
@@ -617,14 +623,11 @@ where
                             self.run_spi();
                         }
                         Direction::None => {
-                            defmt::error!("starting no transaction!?");
-                            return;
-                            // TODO
+                            unreachable!();
                         }
                     }
                 } else {
-                    // Header failed to decode
-                    unimplemented!();
+                    defmt::error!("Failed to decode header");
                 }
             }
             Err(UsbError::WouldBlock) => {
@@ -779,7 +782,8 @@ where
             Some(protocol::ControlIn::HwInfo) => {
                 xfer.accept(|buf| {
                     Ok(
-                        protocol::MasterInfo::new(DEVICE_COUNT as u16, BufferSize::to_u16())
+                        // TODO grab the max clock speed from hardware
+                        protocol::MasterInfo::new(24_000_000, DEVICE_COUNT as u16, BufferSize::to_u16())
                             .encode(buf),
                     )
                 })
@@ -799,12 +803,15 @@ where
             Some(protocol::ControlIn::LinuxSlaveInfo) => {
                 let i = usize::from(req.value);
                 if i < DEVICE_COUNT {
-                    // Safe because we're just reading a static string, and have
-                    // checked the array length already.
-                    let modalias = &unsafe { self.statics.as_mut() }.devices[i].modalias();
+                    // Safe because the methods we call on device act on &self
+                    let device = &unsafe { self.statics.as_mut() }.devices[i];
 
                     xfer.accept(|buf| {
-                        Ok(protocol::ConnectedSlaveInfoLinux::new(modalias).encode(buf))
+                        Ok(protocol::ConnectedSlaveInfoLinux::new(
+                            device.modalias(),
+                            device.max_clock_speed_hz(),
+                            device.capabilities(),
+                        ).encode(buf))
                     })
                     .unwrap_or_else(|_| {
                         defmt::error!("USB-SPI Failed to accept REQUEST_IN_LINUX_SLAVE_INFO")

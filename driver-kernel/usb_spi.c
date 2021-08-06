@@ -17,10 +17,14 @@
 
 #define USB_TIMEOUT_MS 1000
 
-// TODO add max SPI speed, mode, etc (reset state?) and check
-// against them in usb_spi_transfer_one_message()
+#if !defined(SPI_MODE_X_MASK)
+  #define SPI_MODE_X_MASK (SPI_CPOL|SPI_CPHA)
+#endif
+
 struct usb_spi_connected_chip {
+	u32 max_speed_hz;
 	int virq;
+	u8 capabilities;
 	bool irq_mask;
 };
 
@@ -30,10 +34,10 @@ struct usb_spi_device {
 
 	struct usb_spi_connected_chip *connected_chips;
 	u16 connected_chip_count;
-	/// -1 initially, then the index of the selected device
-	int selected_chip;
 
-	// struct usb_spi_connected_peripheral *connected;
+	/// Maximum SPI clock speed the device supports
+	u32 max_speed_hz;
+
 	struct mutex usb_mutex;
 	u16 usb_interface_index;
 	unsigned int bulk_out_pipe;
@@ -135,7 +139,7 @@ static void usb_spi_cleanup(struct spi_device *spi)
 static int usb_spi_transfer_chunk(
 	struct usb_spi_device *usb_spi,
 	struct spi_transfer *xfer,
-	int chip_index,
+	const struct usb_spi_TransferHeader *header_in,
 	unsigned offset
 ) {
 	int ret = 0;
@@ -146,9 +150,7 @@ static int usb_spi_transfer_chunk(
 	// caller has locked usb_mutex already
 
 	struct usb_spi_TransferHeader *header = (struct usb_spi_TransferHeader *) usb_spi->usb_buffer;
-	memset(header, 0, sizeof(*header));
-
-	header->index = chip_index;
+	memcpy(header, header_in, sizeof(*header));
 
 	if (xfer->tx_buf) {
 		data_len = min(data_len, usb_spi->usb_buf_sz - (unsigned)sizeof(*header));
@@ -168,7 +170,7 @@ static int usb_spi_transfer_chunk(
 		data_len = min(data_len, usb_spi->hardware_buf_size);
 		header->direction = usb_spi_Direction_InOnly;
 		header->bytes = cpu_to_le16(data_len);
-		out_len = sizeof(header);
+		out_len = sizeof(*header);
 
 	} else {
 		dev_warn(&usb_spi->usb_dev->dev, "Transfer has no Tx or Rx buf!?");
@@ -224,6 +226,8 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 	struct spi_transfer *xfer = NULL;
 	int ret = 0;
 	int chip_index = mesg->spi->chip_select;
+	const struct usb_spi_connected_chip *chip = &usb_spi->connected_chips[chip_index];
+	struct usb_spi_TransferHeader header = {0};
 
 	mutex_lock(&usb_spi->usb_mutex);
 
@@ -233,21 +237,87 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 		goto err;
 	}
 
+	header.index = cpu_to_le16(mesg->spi->chip_select);
+	header.mode = mesg->spi->mode & SPI_MODE_X_MASK;
+
+	switch (header.mode) {
+		case SPI_MODE_0:
+			if (!(usb_spi_MODE_0 & chip->capabilities)) {
+				ret = -EINVAL;;
+			}
+			break;
+		case SPI_MODE_1:
+			if (!(usb_spi_MODE_1 & chip->capabilities)) {
+				ret = -EINVAL;;
+			}
+			break;
+		case SPI_MODE_2:
+			if (!(usb_spi_MODE_2 & chip->capabilities)) {
+				ret = -EINVAL;;
+			}
+			break;
+		case SPI_MODE_3:
+			if (!(usb_spi_MODE_3 & chip->capabilities)) {
+				ret = -EINVAL;;
+			}
+			break;
+	}
+	if (ret == -EINVAL) {
+		dev_err(&usb_spi->usb_dev->dev,
+		        "SPI message specifies clocking mode %d, unsupported by the chip",
+		        mesg->spi->mode & SPI_MODE_X_MASK);
+		goto err;
+	}
+
+	if (mesg->spi->mode & SPI_LSB_FIRST) {
+		if (!(usb_spi_LSB_FIRST & chip->capabilities)) {
+			dev_err(&usb_spi->usb_dev->dev,
+			        "SPI message specifies least significant bit first, unsupported by the chip");
+			ret = -EINVAL;
+			goto err;
+		}
+		header.mode |= SPI_LSB_FIRST;
+	} else {
+		if (!(usb_spi_MSB_FIRST & chip->capabilities)) {
+			dev_err(&usb_spi->usb_dev->dev,
+			        "SPI message specifies most significant bit first, unsupported by the chip");
+			ret = -EINVAL;
+			goto err;
+		}
+	}
+
 	list_for_each_entry(xfer, &mesg->transfers, transfer_list) {
 		int transferred = 0;
 
 		dev_dbg(&usb_spi->usb_dev->dev, "SPI transfer: %s%s, %dB, Speed:%d",
-		         xfer->tx_buf?"Tx":"", xfer->rx_buf?"Rx":"", xfer->len, xfer->speed_hz);
-		if (xfer->bits_per_word != 8) {
-			dev_warn(&usb_spi->usb_dev->dev,
-			         "SPI transfer has %d bits per word, only 8 is supported",
-					 xfer->bits_per_word);
+		        xfer->tx_buf?"Tx":"", xfer->rx_buf?"Rx":"", xfer->len, xfer->speed_hz);
+		if (xfer->bits_per_word && xfer->bits_per_word != 8) {
+			dev_err(&usb_spi->usb_dev->dev,
+			        "SPI transfer has %d bits per word, only 8 is supported",
+			        xfer->bits_per_word);
+			ret = -EINVAL;
+			goto err;
 		}
 
-	// TODO check SPI mode
+		if ((xfer->tx_nbits && xfer->tx_nbits != SPI_NBITS_SINGLE)
+		    || (xfer->rx_nbits && xfer->rx_nbits != SPI_NBITS_SINGLE)) {
+			dev_err(&usb_spi->usb_dev->dev,
+			        "SPI transfer has tx:%d, rx:%d bits wide, but only single is supported",
+			        xfer->tx_nbits, xfer->rx_nbits);
+			ret = -EINVAL;
+			goto err;
+		}
+
+		if (xfer->speed_hz && xfer->speed_hz > chip->max_speed_hz) {
+			dev_warn(&usb_spi->usb_dev->dev,
+			         "SPI transfer specifies %dHz, %dHz is maximum supported by chip",
+			         xfer->speed_hz, chip->max_speed_hz);
+		}
+
+		header.speed_hz = cpu_to_le32(xfer->speed_hz);
 
 		while (transferred < xfer->len) {
-			ret = usb_spi_transfer_chunk(usb_spi, xfer, mesg->spi->chip_select, transferred);
+			ret = usb_spi_transfer_chunk(usb_spi, xfer, &header, transferred);
 			if (ret < 0) {
 				goto err;
 			}
@@ -358,7 +428,7 @@ static int usb_spi_get_master_info(struct usb_spi_device *usb_spi)
 		goto err;
 	}
 
-	usb_spi->selected_chip = -1;
+	usb_spi->max_speed_hz = le32_to_cpu(info->max_speed_hz);
 	usb_spi->connected_chip_count = le16_to_cpu(info->slave_count);
 	usb_spi->hardware_buf_size = le16_to_cpu(info->in_buf_size);
 
@@ -551,9 +621,7 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 
 	spi_master_set_devdata(spi_master, usb_spi);
 
-	// TODO get parameters from the device?  Do they matter?
-	spi_master->min_speed_hz = 1000;
-	spi_master->max_speed_hz = 1000;
+	spi_master->max_speed_hz = usb_spi->max_speed_hz;
 
 	spi_master->bus_num = -1; // Kernel should allocate our bus_num
 	spi_master->num_chipselect = usb_spi->connected_chip_count;
@@ -578,6 +646,7 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 
 	// TODO this needs to be in a separate method - maybe for all the SPI setup?
 	for (i = 0; i < usb_spi->connected_chip_count; ++i) {
+		struct usb_spi_connected_chip *chip = &usb_spi->connected_chips[i];
 		struct spi_board_info board_info = {0};
 
 		// TODO this pattern needs to check the size of the usb_buffer
@@ -597,11 +666,46 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 			ret = 0;
 		}
 
-		dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d", slave_info->modalias, i);
+		chip->max_speed_hz = le32_to_cpu(slave_info->max_speed_hz);
+		chip->capabilities = slave_info->capabilities;
 
 		board_info.bus_num = spi_master->bus_num;
 		board_info.chip_select = i;
-		board_info.irq = usb_spi->connected_chips[i].virq;
+		board_info.irq = chip->virq;
+		board_info.max_speed_hz = chip->max_speed_hz;
+
+		// Just specify the first supported mode, if the chip's driver picks an
+		// incompatible one, we'll throw an error later
+		if (chip->capabilities & usb_spi_MODE_0) {
+			board_info.mode = SPI_MODE_0;
+		} else if (chip->capabilities & usb_spi_MODE_1) {
+			board_info.mode = SPI_MODE_1;
+		} else if (chip->capabilities & usb_spi_MODE_2) {
+			board_info.mode = SPI_MODE_2;
+		} else if (chip->capabilities & usb_spi_MODE_3) {
+			board_info.mode = SPI_MODE_3;
+		} else {
+			dev_err(&usb_spi->usb_dev->dev,
+			        "Chip \"%s\" on CS %d didn't supply SPI clock phase/polarity info",
+			        slave_info->modalias, i);
+			mutex_unlock(&usb_spi->usb_mutex);
+			continue;
+		}
+
+		if (chip->capabilities & usb_spi_MSB_FIRST) {
+			// default case
+		} else if (chip->capabilities & usb_spi_LSB_FIRST) {
+			board_info.mode |= SPI_LSB_FIRST;
+		} else {
+			dev_err(&usb_spi->usb_dev->dev,
+			        "Chip \"%s\" on CS %d didn't supply bit ordering info",
+			        slave_info->modalias, i);
+			mutex_unlock(&usb_spi->usb_mutex);
+			continue;
+		}
+
+		dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d", slave_info->modalias, i);
+
 		strncpy(board_info.modalias, slave_info->modalias, sizeof(board_info.modalias));
 
 		mutex_unlock(&usb_spi->usb_mutex);
