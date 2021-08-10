@@ -437,6 +437,98 @@ err:
 	return ret;
 }
 
+/// Returns 0 on success, an error code otherwise
+static int setup_chip(struct usb_spi_device *usb_spi, int i)
+{
+	int ret = 0;
+
+	struct usb_spi_connected_chip *chip = &usb_spi->connected_chips[i];
+	struct spi_board_info board_info = {0};
+
+	// TODO this pattern needs to check the size of the usb_buffer
+	struct usb_spi_ConnectedSlaveInfoLinux *slave_info = usb_spi->usb_buffer;
+	mutex_lock(&usb_spi->usb_mutex);
+
+	ret = usb_spi_control_in(usb_spi, usb_spi_ControlIn_LinuxSlaveInfo, i, slave_info, sizeof(*slave_info));
+	if (ret < 0) {
+		dev_err(&usb_spi->usb_dev->dev, "Control IN LinuxSlaveInfo failed %d: %s", ret, error_to_string(ret));
+		goto err;
+	} else if (ret != sizeof(*slave_info)) {
+		dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to LinuxSlaveInfo", ret);
+		ret = -EINVAL;
+		goto err;
+	} else {
+		ret = 0;
+	}
+
+	chip->max_speed_hz = le32_to_cpu(slave_info->max_speed_hz);
+	chip->capabilities = slave_info->capabilities;
+
+	board_info.bus_num = usb_spi->spi_master->bus_num;
+	board_info.chip_select = i;
+	board_info.irq = chip->virq;
+	board_info.max_speed_hz = chip->max_speed_hz;
+
+	// Just specify the first supported mode, if the chip's driver picks an
+	// incompatible one, we'll throw an error later
+	if (chip->capabilities & usb_spi_MODE_0) {
+		board_info.mode = SPI_MODE_0;
+	} else if (chip->capabilities & usb_spi_MODE_1) {
+		board_info.mode = SPI_MODE_1;
+	} else if (chip->capabilities & usb_spi_MODE_2) {
+		board_info.mode = SPI_MODE_2;
+	} else if (chip->capabilities & usb_spi_MODE_3) {
+		board_info.mode = SPI_MODE_3;
+	} else {
+		dev_err(&usb_spi->usb_dev->dev,
+				"Chip \"%s\" on CS %d didn't supply SPI clock phase/polarity info",
+				slave_info->modalias, i);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	if (chip->capabilities & usb_spi_MSB_FIRST) {
+		// default case
+	} else if (chip->capabilities & usb_spi_LSB_FIRST) {
+		board_info.mode |= SPI_LSB_FIRST;
+	} else {
+		dev_err(&usb_spi->usb_dev->dev,
+				"Chip \"%s\" on CS %d didn't supply bit ordering info",
+				slave_info->modalias, i);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	if (chip->capabilities & usb_spi_RESET) {
+		dev_info(&usb_spi->usb_dev->dev, "Resetting \"%s\" on CS %d", slave_info->modalias, i);
+
+		// usb_spi_control_out() doesn't use the USB buffer
+		ret = usb_spi_control_out(usb_spi, usb_spi_ControlOut_AssertReset, i, NULL, 0);
+		if (ret < 0) {
+			goto err;
+		}
+		msleep(5);
+		ret = usb_spi_control_out(usb_spi, usb_spi_ControlOut_DeassertReset, i, NULL, 0);
+		if (ret < 0) {
+			goto err;
+		}
+	}
+
+	dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d", slave_info->modalias, i);
+
+	strncpy(board_info.modalias, slave_info->modalias, sizeof(board_info.modalias));
+
+	mutex_unlock(&usb_spi->usb_mutex);
+
+	spi_new_device(usb_spi->spi_master, &board_info);
+
+	return ret;
+
+err:
+	mutex_unlock(&usb_spi->usb_mutex);
+	return ret;
+}
+
 static void usb_spi_irq_mask(struct irq_data *data)
 {
 	struct usb_spi_device *usb_spi = irq_data_get_irq_chip_data(data);
@@ -644,92 +736,24 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 	dev_info(&usb_dev->dev, "USB-SPI device %s %s %s providing SPI %d",
 	         usb_dev->manufacturer, usb_dev->product, usb_dev->serial, spi_master->bus_num);
 
-	// TODO this needs to be in a separate method - maybe for all the SPI setup?
 	for (i = 0; i < usb_spi->connected_chip_count; ++i) {
-		struct usb_spi_connected_chip *chip = &usb_spi->connected_chips[i];
-		struct spi_board_info board_info = {0};
-
-		// TODO this pattern needs to check the size of the usb_buffer
-		struct usb_spi_ConnectedSlaveInfoLinux *slave_info = usb_spi->usb_buffer;
-		mutex_lock(&usb_spi->usb_mutex);
-
-		ret = usb_spi_control_in(usb_spi, usb_spi_ControlIn_LinuxSlaveInfo, i, slave_info, sizeof(*slave_info));
-		if (ret < 0) {
-			dev_err(&usb_spi->usb_dev->dev, "Control IN LinuxSlaveInfo failed %d: %s", ret, error_to_string(ret));
-			mutex_unlock(&usb_spi->usb_mutex);
-			goto err;
-		} else if (ret != sizeof(*slave_info)) {
-			dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to LinuxSlaveInfo", ret);
-			ret = -EINVAL;
-			mutex_unlock(&usb_spi->usb_mutex);
-			goto err;
-		} else {
-			ret = 0;
-		}
-
-		chip->max_speed_hz = le32_to_cpu(slave_info->max_speed_hz);
-		chip->capabilities = slave_info->capabilities;
-
-		board_info.bus_num = spi_master->bus_num;
-		board_info.chip_select = i;
-		board_info.irq = chip->virq;
-		board_info.max_speed_hz = chip->max_speed_hz;
-
-		// Just specify the first supported mode, if the chip's driver picks an
-		// incompatible one, we'll throw an error later
-		if (chip->capabilities & usb_spi_MODE_0) {
-			board_info.mode = SPI_MODE_0;
-		} else if (chip->capabilities & usb_spi_MODE_1) {
-			board_info.mode = SPI_MODE_1;
-		} else if (chip->capabilities & usb_spi_MODE_2) {
-			board_info.mode = SPI_MODE_2;
-		} else if (chip->capabilities & usb_spi_MODE_3) {
-			board_info.mode = SPI_MODE_3;
-		} else {
-			dev_err(&usb_spi->usb_dev->dev,
-			        "Chip \"%s\" on CS %d didn't supply SPI clock phase/polarity info",
-			        slave_info->modalias, i);
-			mutex_unlock(&usb_spi->usb_mutex);
-			continue;
-		}
-
-		if (chip->capabilities & usb_spi_MSB_FIRST) {
-			// default case
-		} else if (chip->capabilities & usb_spi_LSB_FIRST) {
-			board_info.mode |= SPI_LSB_FIRST;
-		} else {
-			dev_err(&usb_spi->usb_dev->dev,
-			        "Chip \"%s\" on CS %d didn't supply bit ordering info",
-			        slave_info->modalias, i);
-			mutex_unlock(&usb_spi->usb_mutex);
-			continue;
-		}
-
-
-		if (chip->capabilities & usb_spi_RESET) {
-			dev_info(&usb_spi->usb_dev->dev, "Resetting \"%s\" on CS %d", slave_info->modalias, i);
-			
-			// usb_spi_control_out() doesn't use the USB buffer
-			ret = usb_spi_control_out(usb_spi, usb_spi_ControlOut_AssertReset, i, NULL, 0);
-			if (ret < 0) {
-				mutex_unlock(&usb_spi->usb_mutex);
-				goto err;
+		int tries = 0;
+		for (tries = 0; tries < 3; ++tries) {
+			if (tries) {
+				dev_warn(&usb_dev->dev, "Retrying setup of chip %d", i);
 			}
-			msleep(5);
-			ret = usb_spi_control_out(usb_spi, usb_spi_ControlOut_DeassertReset, i, NULL, 0);
-			if (ret < 0) {
-				mutex_unlock(&usb_spi->usb_mutex);
-				goto err;
+			ret = setup_chip(usb_spi, i);
+			if (ret == 0) {
+				break;
 			}
 		}
 
-		dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d", slave_info->modalias, i);
-
-		strncpy(board_info.modalias, slave_info->modalias, sizeof(board_info.modalias));
-
-		mutex_unlock(&usb_spi->usb_mutex);
-
-		spi_new_device(spi_master, &board_info);
+		// If we can't register a particular chip after a few tries, then almost
+		// certainly either the device has been disconnected, got in to a bad
+		// state, or has a misconfigured firmware.  So, tear everything down.
+		if (ret) {
+			goto err;
+		}
 	}
 
 	usb_spi->poll_interval = 100 * 1000; // microseconds
