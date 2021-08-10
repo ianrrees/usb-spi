@@ -101,21 +101,21 @@ static int usb_spi_control_in(struct usb_spi_device *usb_spi, u8 request, u16 va
 	);
 }
 
-// /// Returns number of bytes transferred, or negative error code
-// static int usb_spi_control_out(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
-// {
-// 	return usb_control_msg(
-// 		usb_spi->usb_dev,
-// 		usb_sndctrlpipe(usb_spi->usb_dev, 0),
-// 		request,
-// 		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_OUT,
-// 		value,
-// 		usb_spi->usb_interface_index,
-// 		buf,
-// 		len,
-// 		USB_TIMEOUT_MS
-// 	);
-// }
+/// Returns number of bytes transferred, or negative error code
+static int usb_spi_control_out(struct usb_spi_device *usb_spi, u8 request, u16 value, void *buf, u16 len)
+{
+	return usb_control_msg(
+		usb_spi->usb_dev,
+		usb_sndctrlpipe(usb_spi->usb_dev, 0),
+		request,
+		USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_OUT,
+		value,
+		usb_spi->usb_interface_index,
+		buf,
+		len,
+		USB_TIMEOUT_MS
+	);
+}
 
 // Called after spi_new_device(), not when a driver attaches
 static int usb_spi_setup(struct spi_device *spi)
@@ -661,6 +661,7 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 		} else if (ret != sizeof(*slave_info)) {
 			dev_err(&usb_spi->usb_dev->dev, "Invalid length response (%d) to LinuxSlaveInfo", ret);
 			ret = -EINVAL;
+			mutex_unlock(&usb_spi->usb_mutex);
 			goto err;
 		} else {
 			ret = 0;
@@ -702,6 +703,24 @@ static int usb_spi_probe(struct usb_interface *usb_if, const struct usb_device_i
 			        slave_info->modalias, i);
 			mutex_unlock(&usb_spi->usb_mutex);
 			continue;
+		}
+
+
+		if (chip->capabilities & usb_spi_RESET) {
+			dev_info(&usb_spi->usb_dev->dev, "Resetting \"%s\" on CS %d", slave_info->modalias, i);
+			
+			// usb_spi_control_out() doesn't use the USB buffer
+			ret = usb_spi_control_out(usb_spi, usb_spi_ControlOut_AssertReset, i, NULL, 0);
+			if (ret < 0) {
+				mutex_unlock(&usb_spi->usb_mutex);
+				goto err;
+			}
+			msleep(5);
+			ret = usb_spi_control_out(usb_spi, usb_spi_ControlOut_DeassertReset, i, NULL, 0);
+			if (ret < 0) {
+				mutex_unlock(&usb_spi->usb_mutex);
+				goto err;
+			}
 		}
 
 		dev_info(&usb_spi->usb_dev->dev, "Registering \"%s\" on CS %d", slave_info->modalias, i);

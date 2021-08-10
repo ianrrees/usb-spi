@@ -34,6 +34,21 @@ enum usb_spi_ControlIn {
 typedef uint8_t usb_spi_ControlIn;
 
 /**
+ * Used as the request field of OUT control transfers
+ */
+enum usb_spi_ControlOut {
+  /**
+   * Slave ID is in the value field
+   */
+  usb_spi_ControlOut_AssertReset,
+  /**
+   * Slave ID is in the value field
+   */
+  usb_spi_ControlOut_DeassertReset,
+};
+typedef uint8_t usb_spi_ControlOut;
+
+/**
  * USB convention of the directions used in this transfer
  *
  * USB is used because the protocol could be used for attaching SPI controllers

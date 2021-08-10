@@ -54,6 +54,12 @@ pub trait SpiDevice {
     /// Deassert the device's chip select
     fn deselect(&mut self);
 
+    /// NOP for chips that don't have a reset
+    fn assert_reset(&mut self);
+    
+    /// NOP for chips that don't have a reset
+    fn deassert_reset(&mut self);
+
     /// modalias is how Linux SPI drivers associate devices with controllers
     fn modalias(&self) -> &'static str;
 
@@ -66,28 +72,36 @@ pub trait SpiDevice {
 
 // TODO add interrupt
 // TODO change this to accept embedded_hal's output pin
-pub struct BasicSpiDevice<P>
+pub struct BasicSpiDevice<P, R>
 where
     P: AnyPin<Mode = PushPullOutput>,
+    R: AnyPin<Mode = PushPullOutput>, // TODO change this to an OptionalPin
 {
     cs_pin: P,
+    reset_pin: R,
     modalias: Option<&'static str>,
     max_clock_speed_hz: u32,
     capabilities: SpiDeviceCapabilities,
 }
 
-impl<P> BasicSpiDevice<P>
+impl<P, R> BasicSpiDevice<P, R>
 where
     P: AnyPin<Mode = PushPullOutput> + OutputPin,
+    R: AnyPin<Mode = PushPullOutput> + OutputPin,
 {
+    /// Construct an SPI device that has both a chip select and reset pin
+    ///
+    /// reset_pin is assumed to be active low
     pub fn new(
         cs_pin: impl Into<P>,
+        reset_pin: impl Into<R>,
         modalias: Option<&'static str>,
         max_clock_speed_hz: u32,
         capabilities: SpiDeviceCapabilities,
     ) -> Self {
         Self {
             cs_pin: cs_pin.into(),
+            reset_pin: reset_pin.into(),
             modalias,
             max_clock_speed_hz,
             capabilities,
@@ -95,9 +109,10 @@ where
     }
 }
 
-impl<P> SpiDevice for BasicSpiDevice<P>
+impl<P, R> SpiDevice for BasicSpiDevice<P, R>
 where
     P: AnyPin<Mode = PushPullOutput> + OutputPin,
+    R: AnyPin<Mode = PushPullOutput> + OutputPin,
 {
     fn select(&mut self) {
         self.cs_pin.set_low().ok().unwrap();
@@ -105,6 +120,14 @@ where
 
     fn deselect(&mut self) {
         self.cs_pin.set_high().ok().unwrap();
+    }
+
+    fn assert_reset(&mut self) {
+        self.reset_pin.set_low().ok().unwrap();
+    }
+
+    fn deassert_reset(&mut self) {
+        self.reset_pin.set_high().ok().unwrap();
     }
 
     fn modalias(&self) -> &'static str {
@@ -273,6 +296,7 @@ where
     ) -> Self {
         for device in &mut devices {
             device.deselect();
+            device.assert_reset();
         }
 
         // The default mode/speed don't matter, they'll be set in select_device()
@@ -814,10 +838,10 @@ where
                         ).encode(buf))
                     })
                     .unwrap_or_else(|_| {
-                        defmt::error!("USB-SPI Failed to accept REQUEST_IN_LINUX_SLAVE_INFO")
+                        defmt::error!("USB-SPI Failed to accept LinuxSlaveInfo request")
                     });
                 } else {
-                    defmt::info!("USB-SPI rejecting out-of-range REQUEST_IN_LINUX_SLAVE_INFO");
+                    defmt::info!("USB-SPI rejecting out-of-range LinuxSlaveInfo request");
                     xfer.reject().unwrap_or_else(|_| {
                         defmt::error!("USB-SPI Failed to reject control IN request")
                     });
@@ -842,16 +866,48 @@ where
             return;
         }
 
-        // match protocol::ControlOut::n(req.request) {
-        //     None => {
-        defmt::warn!(
-            "USB-SPI rejecting unknown control_out request {:?}",
-            req.request
-        );
-        xfer.reject()
-            .unwrap_or_else(|_| defmt::error!("USB-SPI Failed to reject control OUT request"));
-        //     }
-        // }
+        match protocol::ControlOut::n(req.request) {
+            Some(protocol::ControlOut::AssertReset) => {
+                let i = usize::from(req.value);
+                if i < DEVICE_COUNT {
+                    let device = &mut unsafe { self.statics.as_mut() }.devices[i];
+                    device.assert_reset();
+
+                    xfer.accept().unwrap_or_else(|_| {
+                        defmt::error!("USB-SPI Failed to accept AssertReset")
+                    });
+                } else {
+                    defmt::info!("USB-SPI rejecting out-of-range AssertReset");
+                    xfer.reject().unwrap_or_else(|_| {
+                        defmt::error!("USB-SPI Failed to reject control OUT request")
+                    });
+                }
+            }
+            Some(protocol::ControlOut::DeassertReset) => {
+                let i = usize::from(req.value);
+                if i < DEVICE_COUNT {
+                    let device = &mut unsafe { self.statics.as_mut() }.devices[i];
+                    device.deassert_reset();
+
+                    xfer.accept().unwrap_or_else(|_| {
+                        defmt::error!("USB-SPI Failed to accept DeassertReset")
+                    });
+                } else {
+                    defmt::info!("USB-SPI rejecting out-of-range DeassertReset");
+                    xfer.reject().unwrap_or_else(|_| {
+                        defmt::error!("USB-SPI Failed to reject control OUT request")
+                    });
+                }
+            }
+            None => {
+                defmt::warn!(
+                    "USB-SPI rejecting unknown control_out request {:?}",
+                    req.request
+                );
+                xfer.reject()
+                    .unwrap_or_else(|_| defmt::error!("USB-SPI Failed to reject control OUT request"));
+            }
+        }
     }
 }
 

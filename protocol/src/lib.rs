@@ -157,11 +157,15 @@ pub enum ControlIn {
     LinuxSlaveInfo,
 }
 
-// /// Used as the request field of OUT control transfers
-// #[derive(Copy, Clone, Debug, N)]
-// #[repr(u8)]
-// pub enum ControlOut {
-// }
+/// Used as the request field of OUT control transfers
+#[derive(Copy, Clone, Debug, N)]
+#[repr(u8)]
+pub enum ControlOut {
+    /// Slave ID is in the value field
+    AssertReset,
+    /// Slave ID is in the value field
+    DeassertReset,
+}
 
 // TODO this could really be a data field in Direction
 bitflags! {
