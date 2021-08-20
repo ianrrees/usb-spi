@@ -6,6 +6,7 @@ use atsamd_hal::{
     },
     hal::digital::v2::OutputPin,
 };
+use cortex_m::asm::delay as cycle_delay;
 use crate::protocol::SpiDeviceCapabilities;
 
 /// Describes an SPI-connected peripheral device
@@ -34,6 +35,19 @@ pub trait SpiDevice {
 
     /// Returns the capabilities bitmask associated with the device
     fn capabilities(&self) -> SpiDeviceCapabilities;
+
+    /// Called in SPI interrupt context, just before a word is written
+    ///
+    /// This is a half-ass implementation of cs_change functionality.  Would be
+    /// good if this could pause indefinitely, but for now just twiddling the CS
+    /// GPIO is good enough.
+    fn pre_word_write(&mut self);
+}
+
+pub enum CsMode {
+    Normal,
+    /// CS needs to be deasserted after each byte
+    CsPerByte,
 }
 
 // TODO add interrupt
@@ -48,6 +62,8 @@ where
     modalias: Option<&'static str>,
     max_clock_speed_hz: u32,
     capabilities: SpiDeviceCapabilities,
+    cs_mode: CsMode,
+    first_word: bool,
 }
 
 impl<P, R> BasicSpiDevice<P, R>
@@ -64,6 +80,7 @@ where
         modalias: Option<&'static str>,
         max_clock_speed_hz: u32,
         capabilities: SpiDeviceCapabilities,
+        cs_mode: CsMode,
     ) -> Self {
         Self {
             cs_pin: cs_pin.into(),
@@ -71,6 +88,8 @@ where
             modalias,
             max_clock_speed_hz,
             capabilities,
+            cs_mode,
+            first_word: false,
         }
     }
 }
@@ -82,6 +101,7 @@ where
 {
     fn select(&mut self) {
         self.cs_pin.set_low().ok().unwrap();
+        self.first_word = true;
     }
 
     fn deselect(&mut self) {
@@ -106,5 +126,20 @@ where
 
     fn capabilities(&self) -> SpiDeviceCapabilities {
         self.capabilities
+    }
+
+    fn pre_word_write(&mut self) {
+        match self.cs_mode {
+            CsMode::Normal => {}
+            CsMode::CsPerByte => {
+                if !self.first_word {
+                    self.deselect();
+                    // TODO figure out a better way to do this, we're in the SERCOM ISR...
+                    cycle_delay(1);
+                    self.select();
+                }
+                self.first_word = false;
+            }
+        }
     }
 }

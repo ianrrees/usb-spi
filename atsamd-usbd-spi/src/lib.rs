@@ -334,6 +334,12 @@ where
             }
         })
     }
+
+    fn pre_word_write(&mut self) {
+        if let Some(index) = self.selected_device {
+            self.devices[index].pre_word_write();
+        }
+    }
 }
 
 impl<'a, B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize>
@@ -858,6 +864,9 @@ where
         match self.usb_to_spi_consumer.read() {
             Ok(grant) => {
                 // The buffer returned is guaranteed to have at least one byte
+                if spi.read_flags().contains(Flags::DRE) {
+                    unsafe {self.statics.as_mut()}.pre_word_write();
+                }
                 match spi.send(grant.buf()[0]) {
                     Ok(()) => {
                         // Don't be tempted to disable DRE here; the ring buffer
