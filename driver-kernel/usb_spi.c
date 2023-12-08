@@ -264,7 +264,7 @@ static int usb_spi_transfer_one_message(struct spi_master *master, struct spi_me
 	}
 	if (ret == -EINVAL) {
 		dev_err(&usb_spi->usb_dev->dev,
-		        "SPI message specifies clocking mode %d, unsupported by the chip",
+		        "SPI message specifies clocking mode %ld, unsupported by the chip",
 		        mesg->spi->mode & SPI_MODE_X_MASK);
 		goto err;
 	}
