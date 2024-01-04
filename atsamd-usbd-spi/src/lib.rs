@@ -1,13 +1,11 @@
 #![no_std]
 
-extern crate atsamd_hal;
-
 use atsamd_hal::{
-    hal::spi::{self, Mode}, // embedded_hal stuff
+    ehal::spi::{self, Mode},
     prelude::*,
-    sercom::v2::spi::{
-        Config, EightBit, Error as SpiError, Errors as SpiErrors, Flags, Master, Rx, Spi, Tx,
-        ValidPads,
+    sercom::spi::{
+        BitOrder, Config, Duplex, EightBit, Error as SpiError, Flags, Master,
+        Spi, Status, ValidPads,
     },
     typelevel::NoneT,
 };
@@ -114,7 +112,7 @@ pub type EventProducer<'a> = spsc::Producer<'a, Event, 16>;
 /// UsbSide and SpiSide have pointers to it.
 pub struct Static<P, const DEVICE_COUNT: usize>
 where
-    P: ValidPads<SS = NoneT> + Tx + Rx,
+    P: ValidPads<SS = NoneT, Capability = Duplex>,
 {
     /// For data from the SPI to the USB
     rx_buffer: BBBuffer<BufferSize>,
@@ -126,7 +124,7 @@ where
     event_queue: EventQueue,
 
     /// The enabled SPI hardware
-    spi: Spi<Config<P, Master, EightBit>>,
+    spi: Spi<Config<P, Master, EightBit>, Duplex>,
 
     /// External SPI devices we're connected to
     devices: [&'static mut dyn SpiDevice; DEVICE_COUNT],
@@ -143,7 +141,7 @@ where
 pub struct UsbSide<'a, B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize>
 where
     B: UsbBus,
-    P: ValidPads<SS = NoneT> + Tx + Rx,
+    P: ValidPads<SS = NoneT, Capability = Duplex>,
 {
     usb_interface: InterfaceNumber,
     read_endpoint: EndpointOut<'a, B>,
@@ -169,7 +167,7 @@ where
 /// Used by the SPI ISR, handles the SPI hardware
 pub struct SpiSide<'a, P, const DEVICE_COUNT: usize>
 where
-    P: ValidPads<SS = NoneT> + Tx + Rx,
+    P: ValidPads<SS = NoneT, Capability = Duplex>,
 {
     /// SPI->USB buffer
     spi_to_usb_producer: Producer<'a, BufferSize>,
@@ -184,7 +182,7 @@ where
 
 impl<P, const DEVICE_COUNT: usize> Static<P, DEVICE_COUNT>
 where
-    P: ValidPads<SS = NoneT> + Tx + Rx,
+    P: ValidPads<SS = NoneT, Capability = Duplex>, 
 {
     pub fn new(
         spi_hardware: Config<P, Master, EightBit>,
@@ -270,7 +268,7 @@ where
         index: usize,
         clock_speed: u32,
         mode: Mode,
-        msb_first: bool,
+        bit_order: BitOrder,
     ) -> UsbSpiResult<()> {
         interrupt::free(|_| {
             // TODO implement the minimum level scheme instead
@@ -305,8 +303,8 @@ where
                         spi::MODE_2 => (capabilities & SpiDeviceCapabilities::MODE_2).is_empty(),
                         spi::MODE_3 => (capabilities & SpiDeviceCapabilities::MODE_3).is_empty(),
                     }
-                    || msb_first && (capabilities & SpiDeviceCapabilities::MSB_FIRST).is_empty()
-                    || !msb_first && (capabilities & SpiDeviceCapabilities::LSB_FIRST).is_empty()
+                    || bit_order == BitOrder::MsbFirst && (capabilities & SpiDeviceCapabilities::MSB_FIRST).is_empty()
+                    || bit_order == BitOrder::LsbFirst && (capabilities & SpiDeviceCapabilities::LSB_FIRST).is_empty()
                 {
                     self.event_queue
                         .enqueue(Event {
@@ -320,8 +318,10 @@ where
                         });
                     Err(Error::UnsupportedByDevice)
                 } else {
-                    self.spi.reconfigure(|c| {
-                        c.baud(clock_speed.hz()).spi_mode(mode).msb_first(msb_first)
+                    self.spi.reconfigure(|config| {
+                        config.set_baud(clock_speed.Hz());
+                        config.set_spi_mode(mode);
+                        config.set_bit_order(bit_order);
                     });
 
                     device.select();
@@ -345,7 +345,7 @@ impl<'a, B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize>
     UsbSide<'a, B, P, DEVICE_COUNT, ENDPOINT_SIZE>
 where
     B: UsbBus,
-    P: ValidPads<SS = NoneT> + Tx + Rx,
+    P: ValidPads<SS = NoneT, Capability = Duplex>,
 {
     fn deselect_device(&mut self) {
         // Safe because Static::deselect_device() does its work in an ISR free block
@@ -513,7 +513,7 @@ where
                                     TransferMode::MODE_3 => spi::MODE_3,
                                     _ => unreachable!(),
                                 },
-                                true,
+                                BitOrder::MsbFirst,
                             ) {
                                 // select_device() has enqueued the error message
                                 return;
@@ -599,7 +599,7 @@ impl<B, P, const DEVICE_COUNT: usize, const ENDPOINT_SIZE: usize> UsbClass<B>
     for UsbSide<'_, B, P, DEVICE_COUNT, ENDPOINT_SIZE>
 where
     B: UsbBus,
-    P: ValidPads<SS = NoneT> + Tx + Rx,
+    P: ValidPads<SS = NoneT, Capability = Duplex>,
 {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> UsbResult<()> {
         writer.interface(
@@ -815,7 +815,7 @@ where
 
 impl<'a, P, const DEVICE_COUNT: usize> SpiSide<'a, P, DEVICE_COUNT>
 where
-    P: ValidPads<SS = NoneT> + Tx + Rx,
+    P: ValidPads<SS = NoneT, Capability = Duplex>,
 {
     /// This is only ever called in an SPI interrupt context
     pub fn spi_callback(&mut self) {
@@ -836,7 +836,10 @@ where
                     }
                     Err(nb::Error::Other(SpiError::Overflow)) => {
                         defmt::error!("SPI Overflow in callback read"); // TODO
-                        spi.clear_errors(SpiErrors::BUFOVF);
+                        spi.clear_status(Status::BUFOVF);
+                    }
+                    Err(nb::Error::Other(SpiError::LengthError)) => {
+                        defmt::error!("SPI Length Error in callback write"); // TODO
                     }
                 }
             }
@@ -848,7 +851,10 @@ where
                     Err(nb::Error::WouldBlock) => {}
                     Err(nb::Error::Other(SpiError::Overflow)) => {
                         defmt::error!("SPI Overflow in callback discard");
-                        spi.clear_errors(SpiErrors::BUFOVF);
+                        spi.clear_status(Status::BUFOVF);
+                    }
+                    Err(nb::Error::Other(SpiError::LengthError)) => {
+                        defmt::error!("SPI Length Error in callback write"); // TODO
                     }
                 }
             }
@@ -877,7 +883,10 @@ where
                     }
                     Err(nb::Error::Other(SpiError::Overflow)) => {
                         defmt::error!("SPI Overflow in callback write"); // TODO
-                        spi.clear_errors(SpiErrors::BUFOVF);
+                        spi.clear_status(Status::BUFOVF);
+                    }
+                    Err(nb::Error::Other(SpiError::LengthError)) => {
+                        defmt::error!("SPI Length Error in callback write"); // TODO
                     }
                 };
             }

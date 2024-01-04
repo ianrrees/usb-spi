@@ -1,10 +1,10 @@
 // embedded_hal digital output trait
 use atsamd_hal::{
-    gpio::v2::{
+    ehal::digital::v2::OutputPin,
+    gpio::{
         AnyPin,
         PushPullOutput,
     },
-    hal::digital::v2::OutputPin,
 };
 use cortex_m::asm::delay as cycle_delay;
 use crate::protocol::SpiDeviceCapabilities;
