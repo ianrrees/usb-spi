@@ -1,13 +1,10 @@
 // embedded_hal digital output trait
+use crate::protocol::SpiDeviceCapabilities;
 use atsamd_hal::{
     ehal::digital::v2::OutputPin,
-    gpio::{
-        AnyPin,
-        PushPullOutput,
-    },
+    gpio::{AnyPin, PushPullOutput},
 };
 use cortex_m::asm::delay as cycle_delay;
-use crate::protocol::SpiDeviceCapabilities;
 
 /// Describes an SPI-connected peripheral device
 ///
@@ -23,7 +20,7 @@ pub trait SpiDevice {
 
     /// NOP for chips that don't have a reset
     fn assert_reset(&mut self);
-    
+
     /// NOP for chips that don't have a reset
     fn deassert_reset(&mut self);
 

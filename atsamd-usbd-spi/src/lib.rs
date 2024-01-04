@@ -4,8 +4,8 @@ use atsamd_hal::{
     ehal::spi::{self, Mode},
     prelude::*,
     sercom::spi::{
-        BitOrder, Config, Duplex, EightBit, Error as SpiError, Flags, Master,
-        Spi, Status, ValidPads,
+        BitOrder, Config, Duplex, EightBit, Error as SpiError, Flags, Master, Spi, Status,
+        ValidPads,
     },
     typelevel::NoneT,
 };
@@ -182,7 +182,7 @@ where
 
 impl<P, const DEVICE_COUNT: usize> Static<P, DEVICE_COUNT>
 where
-    P: ValidPads<SS = NoneT, Capability = Duplex>, 
+    P: ValidPads<SS = NoneT, Capability = Duplex>,
 {
     pub fn new(
         spi_hardware: Config<P, Master, EightBit>,
@@ -303,8 +303,10 @@ where
                         spi::MODE_2 => (capabilities & SpiDeviceCapabilities::MODE_2).is_empty(),
                         spi::MODE_3 => (capabilities & SpiDeviceCapabilities::MODE_3).is_empty(),
                     }
-                    || bit_order == BitOrder::MsbFirst && (capabilities & SpiDeviceCapabilities::MSB_FIRST).is_empty()
-                    || bit_order == BitOrder::LsbFirst && (capabilities & SpiDeviceCapabilities::LSB_FIRST).is_empty()
+                    || bit_order == BitOrder::MsbFirst
+                        && (capabilities & SpiDeviceCapabilities::MSB_FIRST).is_empty()
+                    || bit_order == BitOrder::LsbFirst
+                        && (capabilities & SpiDeviceCapabilities::LSB_FIRST).is_empty()
                 {
                     self.event_queue
                         .enqueue(Event {
@@ -506,7 +508,9 @@ where
                             if let Err(_) = unsafe { self.statics.as_mut() }.select_device(
                                 index,
                                 header.speed_hz,
-                                match TransferMode::from_bits_truncate(header.mode) & TransferMode::MODE_MASK {
+                                match TransferMode::from_bits_truncate(header.mode)
+                                    & TransferMode::MODE_MASK
+                                {
                                     TransferMode::MODE_0 => spi::MODE_0,
                                     TransferMode::MODE_1 => spi::MODE_1,
                                     TransferMode::MODE_2 => spi::MODE_2,
@@ -709,8 +713,12 @@ where
                 xfer.accept(|buf| {
                     Ok(
                         // TODO grab the max clock speed from hardware
-                        protocol::MasterInfo::new(24_000_000, DEVICE_COUNT as u16, BufferSize::to_u16())
-                            .encode(buf),
+                        protocol::MasterInfo::new(
+                            24_000_000,
+                            DEVICE_COUNT as u16,
+                            BufferSize::to_u16(),
+                        )
+                        .encode(buf),
                     )
                 })
                 .unwrap_or_else(|_| defmt::error!("USB-SPI Failed to accept REQUEST_IN_HW_INFO"));
@@ -737,7 +745,8 @@ where
                             device.modalias(),
                             device.max_clock_speed_hz(),
                             device.capabilities(),
-                        ).encode(buf))
+                        )
+                        .encode(buf))
                     })
                     .unwrap_or_else(|_| {
                         defmt::error!("USB-SPI Failed to accept LinuxSlaveInfo request")
@@ -775,9 +784,8 @@ where
                     let device = &mut unsafe { self.statics.as_mut() }.devices[i];
                     device.assert_reset();
 
-                    xfer.accept().unwrap_or_else(|_| {
-                        defmt::error!("USB-SPI Failed to accept AssertReset")
-                    });
+                    xfer.accept()
+                        .unwrap_or_else(|_| defmt::error!("USB-SPI Failed to accept AssertReset"));
                 } else {
                     defmt::info!("USB-SPI rejecting out-of-range AssertReset");
                     xfer.reject().unwrap_or_else(|_| {
@@ -806,8 +814,9 @@ where
                     "USB-SPI rejecting unknown control_out request {:?}",
                     req.request
                 );
-                xfer.reject()
-                    .unwrap_or_else(|_| defmt::error!("USB-SPI Failed to reject control OUT request"));
+                xfer.reject().unwrap_or_else(|_| {
+                    defmt::error!("USB-SPI Failed to reject control OUT request")
+                });
             }
         }
     }
@@ -870,7 +879,7 @@ where
             Ok(grant) => {
                 // The buffer returned is guaranteed to have at least one byte
                 if spi.read_flags().contains(Flags::DRE) {
-                    unsafe {self.statics.as_mut()}.pre_word_write();
+                    unsafe { self.statics.as_mut() }.pre_word_write();
                 }
                 match spi.send(grant.buf()[0]) {
                     Ok(()) => {
